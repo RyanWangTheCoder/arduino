@@ -129,105 +129,25 @@ if(hc06.available())
   }
   else
   {
-  printonLCD();
-  lcd.setCursor(0,1);
-  lcd.print("total bytes RX");
-  lcd.setCursor(14,1);
-  lcd.print(totalbytes);
+  printOnLCD();
   }
- /* if((c<=15)&&(r==0))
-  {
-  lcd.print(val);
-  //Serial.print(val);
-  c++;
-  lcd.setCursor(c,r);
-  
-  }
-  if(c>15)
-  {
-    lcd.setCursor(R,1);
-    lcd.print(val);
-    //Serial.print(val);
-    R++;
-  }
-  if(R>15)
-  {
-    lcd.clear();
-    lcd.setCursor(0,0);
-    c=0;
-    r=0;
-    R=0;
-  }*/
   }
 delay(50);
 }
-void printonLCD()
+void printOnLCD()
 {
-  for(i=1;i<totalbytes;i++)
+  for(i=0;i<totalbytes;i++)
   {
     //String tmp = String((char)receivedBytes[0]) + String((char)receivedBytes[1]) + String((char)receivedBytes[2]);
     lcd.setCursor(c,0);
     lcd.print((char)val[i]);
-    delay(500);
+    Serial.print((char)val[i]);
+    delay(100);
     c++;
   }
-}
-void do_bluetooth1() {
-  if(hc06.available())
-  {
-  //val = hc06.read();
-  if((c<=15)&&(r==0))
-  {
-  lcd.write(val);
-  Serial.write(val);
-  c++;
-  lcd.setCursor(c,r);
-
-  }
-  if(c>15)
-  {
-    lcd.setCursor(R,1);
-    lcd.write(val);
-    R++;
-  }
-  if(R>15)
-  {
-    lcd.clear();
-    lcd.setCursor(0,0);
-    c=0;
-    r=0;
-    R=0;
-  }
-  }
-  delay(200);
+  Serial.println();
 }
 
-void do_bluetooth0() {
-  
-  if (hc06.available()) {
-    char  s = hc06.read();
-    lcd.print(s);
-    Serial.write(s);
-  }
-  /*
-  if(hc06.read() == '1')
-    lcd.print("is 1");
-  else
-    lcd.print("not 1"); //hc06.read());*/
-  delay(200);          
- 
-  //lcd.print("alive");
-
-  /*
-  if (hc06.available()){
-    Serial.write(hc06.read());
-  }
-  
-  //Write from Serial Monitor to HC06
-  if (Serial.available()){
-    hc06.write(Serial.read());
-  } */ 
-}
 // the loop function runs over and over again forever
 void loop() {
   ///redValue = 255; // choose a value between 1 and 255 to change the color.
