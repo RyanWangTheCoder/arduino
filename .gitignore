@@ -5,3 +5,4 @@ libraries/*
 CoolTermWin64bit/*
 *.stc
 BT_talk/*
+py_scripts/.idea/*
