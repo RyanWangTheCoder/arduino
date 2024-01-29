@@ -92,8 +92,9 @@ void loop()
         level_buf = level;
         //bar.setLevel(level);
         //Serial.print("level: ");
-        Serial.println(level);
+        //Serial.println(level);
     }
+    Serial.println(val);
     
     delay(10);
 }

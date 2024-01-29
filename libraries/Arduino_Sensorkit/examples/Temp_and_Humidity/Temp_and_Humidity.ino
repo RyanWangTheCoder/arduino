@@ -1,12 +1,15 @@
-//#define DHTPIN 3 // By default its connected to pin D3, it can be changed, define it before the #include of the library
 #include "Arduino_SensorKit.h"
 
-//uncomment line below if using DHT20
+// Uncomment line below if your SensorKit is the variant with the DHT20 sensor
+// (It's marked IIC on the PCB and has a black cover, while the DHT11 sensor
+// has a blue cover.)
 //#define Environment Environment_I2C
 
 void setup() {
-  //uncomment line below if using DHT20
-  //Wire.begin();
+  // Uncomment line below if your kit has a DHT11 and you're connecting it to 
+  // a pin different than 3
+  //Environment.setPin(4);
+
   Serial.begin(9600);
   Environment.begin();
 }

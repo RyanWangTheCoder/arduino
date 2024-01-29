@@ -1,0 +1,7 @@
+*.txt
+*.log
+libraries/*
+*.cmd
+CoolTermWin64bit/*
+*.stc
+BT_talk/*
