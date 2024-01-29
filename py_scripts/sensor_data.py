@@ -8,6 +8,8 @@ from datetime import datetime
 from pykalman import KalmanFilter
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from scipy.signal import savgol_filter
+import scipy.fftpack
+import pylab
 
 class EMGDataHelper:
     def __init__(self, data_file):
@@ -156,8 +158,19 @@ class EMGDataHelper:
         plt.plot(smoothed_values, label='Exponential Smoothing')
         plt.legend()
         plt.grid()
-
         plt.show()
+    def doFreqPlot(self):
+        #FFT = abs(scipy.fft(self.dataValue))
+        FFT = np.fft.fft(self.dataValue)
+        #freqs = scipy.fftpack.fftfreq(len(self.timestamp), self.timestamps[1] - self.timestamps[0])
+
+        pylab.subplot(211)
+        pylab.plot(self.timestamps, self.dataValue)
+        pylab.grid()
+        pylab.subplot(212)
+        pylab.plot(self.timestamps, 20 * np.log10(FFT), 'x')
+        pylab.grid()
+        pylab.show()
 class GSRDataHelper:
     def __init__(self, data_file):
         self.dataFile = data_file
@@ -175,6 +188,7 @@ if __name__ == '__main__':
     #emgData.doInterp()
     #emgData.doMovingAverage()
     #emgData.doKalmanFilter()
-    emgData.doSavitzkyGolayFilter()
+    #emgData.doSavitzkyGolayFilter()
+    emgData.doFreqPlot()
     #emgData.exponentialFilter()
     #gsrData = GSRDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\new.txt")
