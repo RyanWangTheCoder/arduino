@@ -274,18 +274,50 @@ class EMGDataHelper:
         ax[1].set_ylabel('Frequency [Hz]')
         ax[1].set_xlabel('Time [sec]')
         plt.show()
+
+        fig, ax = plt.subplots(2, figsize=(8, 7))
+
+        f1, t1, Sxx1 = signal.spectrogram(dataValue, fs, return_onesided=False)
+        ax[0].plot(f1, abs(Sxx1))
+        ax[0].set_ylabel('Frequency [Hz]')
+        ax[0].set_xlabel('Time [sec]')
+        f2, t2, Sxx2 = signal.spectrogram(dataValue2, fs, return_onesided=False)
+        ax[1].plot(f2, abs(Sxx2))
+        ax[1].set_ylabel('Frequency [Hz]')
+        ax[1].set_xlabel('Time [sec]')
+        plt.show()
+    def doOneSpectrum(self, dfData):
+        dataValue = dfData['value']
+        x = np.linspace(1, len(dataValue), num=len(dataValue))
+        dfData['time'] = dfData['time'] - dfData['time'].iloc[0]
+        time_series = dfData['time']
+        # print(time_series, time_series.iloc[0])
+        end_time = time_series.iloc[len(time_series) - 1]
+        # print(end_time)
+        timestamps = np.linspace(0, end_time, len(time_series))
+        fs = 60
+        f, t, Sxx = signal.spectrogram(dataValue, fs, return_onesided=False)
+        plt.pcolormesh(t, fftshift(f), fftshift(Sxx, axes=0))
+        plt.xlabel('Time [sec]')
+        plt.ylabel('Frequency [Hz]')
+        plt.figure()
+        plt.plot(timestamps/1000, dataValue)
+        plt.grid()
+        plt.show()
     def splitHeadTail(self):
         subFirst50 = self.data[(self.data["time"] > 150000)]
         subFirst50 = subFirst50[(subFirst50["time"] < 200000)]
         subLast50 = self.data[(self.data["time"] > 380000)]
         subLast50 = subLast50[(subLast50["time"] < 430000)]
-        print(subFirst50)
+        #print(subFirst50)
         self.doMovingAverage(subFirst50)
         #self.doFreqPlot(subFirst50)
         #print(subLast50)
         self.doMovingAverage(subLast50)
         #self.doFreqPlot(subLast50)
-        self.doTwoSpectrum(subFirst50, subLast50)
+        #self.doTwoSpectrum(subFirst50, subLast50)
+    def showTimeFreq(self):
+        self.doOneSpectrum(self.data)
 class GSRDataHelper:
     def __init__(self, data_file):
         self.dataFile = data_file
@@ -299,12 +331,13 @@ class GSRDataHelper:
 
 
 if __name__ == '__main__':
-    emgData = EMGDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\emg.txt")
-    emgData.doInterp(emgData.data)
-    emgData.doMovingAverage(emgData.data)
-    emgData.doKalmanFilter(emgData.data)
+    emgData = EMGDataHelper("..\\emg_first_last.txt")
+    #emgData.doInterp(emgData.data)
+    #emgData.doMovingAverage(emgData.data)
+    #emgData.doKalmanFilter(emgData.data)
     #emgData.doSavitzkyGolayFilter(emgData.data)
     #emgData.doFreqPlot(emgData.data)
     #emgData.exponentialFilter(emgData.data)
     #gsrData = GSRDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\new.txt")
     #emgData.splitHeadTail()
+    emgData.showTimeFreq()
