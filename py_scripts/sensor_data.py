@@ -111,23 +111,22 @@ class EMGDataHelper:
         y = self.butter_lowpass_filter(dataValue, cutoff, fs, order)
 
 
-        plt.subplot(2, 1, 1)
-        plt.plot(timestamps/1000, dataValue, 'b-', label='data')
+        #plt.subplot(2, 1, 1)
+        plt.plot(timestamps/1000, dataValue, 'b-', label='original data')
         #plt.plot(self.x, y, 'g-', linewidth=2, label='filtered data')
         plt.xlabel('Time [sec]')
-        plt.ylabel('GSR data')
+        plt.ylabel('EMG data')
 
-        plt.grid()
-
-        plt.subplot(2, 1, 2)
-        plt.plot(timestamps / 1000, dataValue.rolling(window=50).mean(), 'b-', label='data')
+        #plt.grid()
+        #plt.subplot(2, 1, 2)
+        plt.plot(timestamps / 1000, dataValue.rolling(window=50).mean(), 'r-', label='smoothed data')
         # plt.plot(self.x, y, 'g-', linewidth=2, label='filtered data')
-        plt.xlabel('Time [sec]')
-        plt.ylabel('GSR data')
-
+        plt.xlabel('Time [sec]', fontsize=18)
+        plt.ylabel('EMG data', fontsize=18)
         plt.grid()
+        plt.legend(["original data", "smoothed data"], fontsize="20", loc="upper left")
 
-        plt.subplots_adjust(hspace=0.35)
+        #plt.subplots_adjust(hspace=0.35)
         plt.show()
 
     def doKalmanFilter(self, dfData):
@@ -300,9 +299,9 @@ class GSRDataHelper:
 
 if __name__ == '__main__':
     emgData = EMGDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\emg.txt")
-    emgData.doInterp(emgData.data)
+    #emgData.doInterp(emgData.data)
     emgData.doMovingAverage(emgData.data)
-    emgData.doKalmanFilter(emgData.data)
+    #emgData.doKalmanFilter(emgData.data)
     #emgData.doSavitzkyGolayFilter(emgData.data)
     #emgData.doFreqPlot(emgData.data)
     #emgData.exponentialFilter(emgData.data)
