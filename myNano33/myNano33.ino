@@ -55,6 +55,8 @@ void loop() {
         // Process the received data (e.g., parse JSON)
         Serial.print("Received data: ");
         Serial.println(receivedData);
+        int emgData = 331;
+        switchCharacteristic.writeValue(65);
       }
     }
 

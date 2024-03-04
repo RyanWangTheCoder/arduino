@@ -19,6 +19,7 @@ int static_analog_dta   = 0;                // static analog data
 
 int level       = 5;
 int level_buf   = 5;
+int emgData = 555;
 
 // get analog value
 int getEMGAnalog(int pin)
@@ -96,8 +97,9 @@ void loopEMG()
         //Serial.print("level: ");
         //Serial.println(level);
     }
+    Serial.print("EMG data:");
     Serial.println(val);
-    
+    emgData = val;
     delay(10);
 }
 
@@ -105,12 +107,17 @@ void loopEMG()
 // Define the name of the Bluetooth peripheral
 const char* peripheralName = "R4_RYANW_EMG";
 
-// Create a BLE Service
-BLEService fileTransferService("19B10000-E8F2-537E-4F6C-D104768A1214");
-
-// Create a BLE Characteristic for receiving data
-const char* dataCharacteristicUUID = "19B10001-E8F2-537E-4F6C-D104768A1214";
-BLECharacteristic dataCharacteristic(dataCharacteristicUUID, BLEWrite | BLERead, "");
+// // Create a BLE Service
+// BLEService fileTransferService("19B10000-E8F2-537E-4F6C-D104768A1214");
+// // Create a BLE Characteristic for receiving data
+// const char* dataCharacteristicUUID = "19B10001-E8F2-537E-4F6C-D104768A1214";
+// BLECharacteristic dataCharacteristic(dataCharacteristicUUID, BLEWrite | BLERead, "");
+const int characteristicSize = 128;
+BLEService stringService("7DEF8317-7300-4EE6-8849-46FACE74CA2A");
+BLEStringCharacteristic txCharacteristic("7DEF8317-7301-4EE6-8849-46FACE74CA2A",
+    BLERead | BLENotify, characteristicSize);
+BLEStringCharacteristic rxCharacteristic("7DEF8317-7302-4EE6-8849-46FACE74CA2A",
+    BLEWrite, characteristicSize);
 
 void setup() {
   // Initialize the Serial communication for debugging
@@ -124,10 +131,14 @@ void setup() {
 
   // Set the local name of the Bluetooth peripheral
   BLE.setLocalName(peripheralName);
-  BLE.setAdvertisedService(fileTransferService);
+  BLE.setAdvertisedService(stringService);
 
   // Add the characteristics to the service
-  fileTransferService.addCharacteristic(dataCharacteristic);
+  stringService.addCharacteristic(txCharacteristic);
+  stringService.addCharacteristic(rxCharacteristic);
+
+  txCharacteristic.writeValue("hello");
+  BLE.addService(stringService);
 
   // Start advertising
   BLE.advertise();
@@ -136,22 +147,33 @@ void setup() {
   
   setupEMG();
 }
-
+void RxFromBT() {
+  int count;
+  String receivedData = "";
+  count = rxCharacteristic.valueSize();
+  Serial.print("valueLength: ");
+  Serial.println(count);
+  if (count > 0) {
+    //Serial.print("read ");
+    //Serial.println(dataCharacteristic.read());
+    //dataCharacteristic.readValue()
+    receivedData = rxCharacteristic.value();
+    // Process the received data (e.g., parse JSON)
+    Serial.print("Received data: ");
+    Serial.println(receivedData);
+  }
+}
 void loop() {
   BLEDevice central = BLE.central();
   if (central) {
     Serial.print("Connected to central: ");
     Serial.println(central.address());
-    char receivedData [200] ;
 
     while (central.connected()) {
       loopEMG();
-      if (dataCharacteristic.written()) {
-        strcpy (receivedData, (const char*) dataCharacteristic.value());
-        // Process the received data (e.g., parse JSON)
-        Serial.print("Received data: ");
-        Serial.println(receivedData);
+      RxFromBT();
+      String txString = String(emgData);
+      txCharacteristic.setValue(txString);
       }
-    }
   }
 }
