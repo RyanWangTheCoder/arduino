@@ -12,7 +12,14 @@
 
 #include <ArduinoBLE.h>
 
+const int GSR=A3;
+const int EMG=A0;
 
+// GSR
+int gsrData = 999;
+int lastGsrData = 0;
+
+// EMG
 int max_analog_dta      = 300;              // max analog data
 int min_analog_dta      = 100;              // min analog data
 int static_analog_dta   = 0;                // static analog data
@@ -20,6 +27,7 @@ int static_analog_dta   = 0;                // static analog data
 int level       = 5;
 int level_buf   = 5;
 int emgData = 555;
+int lastEmgData = 0;
 
 // get analog value
 int getEMGAnalog(int pin)
@@ -39,6 +47,21 @@ int getEMGAnalog(int pin)
     return sum>>5;
 }
 
+int getGSRAnalog(int pin) {
+  int sensorGSRValue=0;
+  int gsr_average=0;
+  long sum=0;
+  for(int i=0;i<10;i++)           //Average the 10 measurements to remove the glitch
+  {
+    sensorGSRValue=analogRead(pin);
+    sum += sensorGSRValue;
+    delay(5);
+  }
+  gsr_average = sum/10;
+  return gsr_average;
+}
+
+
 void setupEMG()
 {
     Serial.begin(9600);
@@ -49,7 +72,7 @@ void setupEMG()
     {
         for(int j=0; j<100; j++)
         {
-            sum += getEMGAnalog(A0);
+            sum += getEMGAnalog(EMG);
             delay(1);
         }
         
@@ -63,44 +86,50 @@ void setupEMG()
     Serial.print("static_analog_dta = ");
     Serial.println(static_analog_dta);
 }
+void loopGSR() 
+{
+  int val = getGSRAnalog(GSR);
+  gsrData = val;
+  Serial.print("GSR: ");
+  Serial.println(gsrData);
+}
 
 void loopEMG()
 {
+    int val = getEMGAnalog(EMG);                    // get Analog value
+    
+    // int level2;
+    
+    // if(val>static_analog_dta)                   // larger than static_analog_dta
+    // {
+    //     level2 = 5 + map(val, static_analog_dta, max_analog_dta, 0, 5);
+    // }
+    // else 
+    // {
+    //     level2 = 5 - map(val, min_analog_dta, static_analog_dta, 0, 5);
+    // }
+    
+    // // to smooth the change of led bar
+    // if(level2 > level)
+    // {
+    //     level++;
+    // }
+    // else if(level2 < level)
+    // {
+    //     level--;
+    // }
 
-    int val = getEMGAnalog(A0);                    // get Analog value
-    
-    int level2;
-    
-    if(val>static_analog_dta)                   // larger than static_analog_dta
-    {
-        level2 = 5 + map(val, static_analog_dta, max_analog_dta, 0, 5);
-    }
-    else 
-    {
-        level2 = 5 - map(val, min_analog_dta, static_analog_dta, 0, 5);
-    }
-    
-    // to smooth the change of led bar
-    if(level2 > level)
-    {
-        level++;
-    }
-    else if(level2 < level)
-    {
-        level--;
-    }
-
-    if(level != level_buf)
-    {
-        level_buf = level;
-        //bar.setLevel(level);
-        //Serial.print("level: ");
-        //Serial.println(level);
-    }
+    // if(level != level_buf)
+    // {
+    //     level_buf = level;
+    //     //bar.setLevel(level);
+    //     //Serial.print("level: ");
+    //     //Serial.println(level);
+    // }
     Serial.print("EMG data:");
     Serial.println(val);
     emgData = val;
-    delay(10);
+    //delay(10);
 }
 
 
@@ -137,8 +166,8 @@ void setup() {
   stringService.addCharacteristic(txCharacteristic);
   stringService.addCharacteristic(rxCharacteristic);
 
-  txCharacteristic.writeValue("hello");
   BLE.addService(stringService);
+  txCharacteristic.writeValue("hello");
 
   // Start advertising
   BLE.advertise();
@@ -163,6 +192,7 @@ void RxFromBT() {
     Serial.println(receivedData);
   }
 }
+
 void loop() {
   BLEDevice central = BLE.central();
   if (central) {
@@ -171,9 +201,15 @@ void loop() {
 
     while (central.connected()) {
       loopEMG();
+      loopGSR();
       RxFromBT();
-      String txString = String(emgData);
-      txCharacteristic.setValue(txString);
+      if ((lastEmgData != emgData) || (lastGsrData != gsrData)) {
+        String txString = String(emgData) + ' ' + String(gsrData);
+        txCharacteristic.setValue(txString);
+        lastEmgData = emgData;
+        lastGsrData = gsrData;
+        Serial.println(txString);
       }
+    }
   }
 }
