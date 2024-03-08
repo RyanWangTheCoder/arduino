@@ -10,9 +10,8 @@
 //LED_Bar bar(9, 8);
 
 #include <ArduinoBLE.h>
-
-const int GSR=A0;
 const int EMG=A0;
+const int GSR=A2;
 
 // GSR
 int gsrData = 999;
@@ -140,7 +139,7 @@ const char* peripheralName = "R4_RYANW_EMG";
 // // Create a BLE Characteristic for receiving data
 // const char* dataCharacteristicUUID = "19B10001-E8F2-537E-4F6C-D104768A1214";
 // BLECharacteristic dataCharacteristic(dataCharacteristicUUID, BLEWrite | BLERead, "");
-const int characteristicSize = 128;
+const int characteristicSize = 40;
 BLEService stringService("7DEF8317-7300-4EE6-8849-46FACE74CA2A");
 BLEStringCharacteristic txCharacteristic("7DEF8317-7301-4EE6-8849-46FACE74CA2A",
     BLERead | BLENotify, characteristicSize);
@@ -197,18 +196,25 @@ void loop() {
   if (central) {
     Serial.print("Connected to central: ");
     Serial.println(central.address());
-
+    
     while (central.connected()) {
-      loopEMG();
+      String txString = "";
+      int emgAggregationCount = 1;
+      while (emgAggregationCount > 0 ) {
+        loopEMG();      
+        //RxFromBT();
+        //if ((lastEmgData != emgData) || (lastGsrData != gsrData)) {
+        txString = txString + String(emgData) + " ";
+        emgAggregationCount = emgAggregationCount - 1;
+      } 
       loopGSR();
-      //RxFromBT();
-      if ((lastEmgData != emgData) || (lastGsrData != gsrData)) {
-        String txString = String(emgData) + ' ' + String(gsrData);
-        txCharacteristic.setValue(txString);
-        lastEmgData = emgData;
-        lastGsrData = gsrData;
-        Serial.println(txString);
-      }
+
+      txString = txString + String(gsrData);
+      Serial.print("txString:");
+      Serial.println(txString);
+      txCharacteristic.setValue(txString);
+      lastEmgData = emgData;
+      lastGsrData = gsrData;
     }
   }
 }
