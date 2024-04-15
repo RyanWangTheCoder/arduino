@@ -1,4 +1,4 @@
-const int GSR=A0;
+const int GSR=A1;
 int sensorValue=0;
 int gsr_average=0;
 
