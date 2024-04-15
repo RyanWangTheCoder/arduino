@@ -11,7 +11,7 @@ from scipy.signal import savgol_filter
 import pylab
 #from scipy.signal import complex_cepstrum
 from scipy.fft import fftshift
-
+import os
 class EMGDataHelper:
     def __init__(self, data_file):
         self.dataFile = data_file
@@ -318,19 +318,59 @@ class EMGDataHelper:
     def showTimeFreq(self):
         self.doOneSpectrum(self.data)
 class GSRDataHelper:
+    def doOneSpectrum(self, dfData):
+        dataValue = dfData['value']
+        x = np.linspace(1, len(dataValue), num=len(dataValue))
+        dfData['time'] = dfData['time'] - dfData['time'].iloc[0]
+        time_series = dfData['time']
+        # print(time_series, time_series.iloc[0])
+        end_time = time_series.iloc[len(time_series) - 1]
+        # print(end_time)
+        timestamps = np.linspace(0, end_time, len(time_series))
+        fs = 60
+        f, t, Sxx = signal.spectrogram(dataValue, fs, return_onesided=False)
+        plt.pcolormesh(t, fftshift(f), fftshift(Sxx, axes=0))
+        plt.xlabel('Time [sec]')
+        plt.ylabel('Frequency [Hz]')
+        plt.figure()
+        plt.plot(timestamps/1000, dataValue)
+        plt.grid()
+        plt.show()
+    def preProcess(self, file):
+        cwd = os.getcwd()
+        # Print the current working directory
+        print(cwd)
+        with open(file) as file:
+            f_tmp = open("tmp.txt", "w")
+            for line in file:
+                if len(line) > 8:
+                    f_tmp.write(line)
+            f_tmp.close()
+        file.close()
     def __init__(self, data_file):
-        self.dataFile = data_file
-        self.data = pd.read_csv(self.dataFile, sep=' --> ', header=None, names=["time", "value"], engine='python')
+        self.preProcess(data_file)
+        self.dataFile = "tmp.txt"
+        self.data = pd.read_csv(self.dataFile, sep='\t', header=None, names=["time", "value"], engine='python')
         print(self.data)
         for index, row in self.data.iterrows():
             t = self.data.loc[index, 'time']
-            self.data.iloc[index, 0] = datetime.strptime(t, '%H:%M:%S.%f').time()
+            if index == 0:
+                start_log_time = datetime.strptime(t, '%H:%M:%S.%f')
+            duration = datetime.strptime(t, '%H:%M:%S.%f') - start_log_time
+            self.data.iloc[index, 0] = duration.seconds * 1000 + duration.microseconds/1000
             self.data.iloc[index, 1] = float(self.data.loc[index, 'value'])
         print(self.data)
+        self.x = np.linspace(1, len(self.data), num=len(self.data))
+        self.timeX = self.data['time']
+        self.dataValue = self.data['value']
+
+        time_series = self.data['time']
+        end_time = time_series[len(time_series) - 1]
+        self.timestamps = np.linspace(0, end_time, len(time_series))
 
 
 if __name__ == '__main__':
-    emgData = EMGDataHelper("..\\emg_first_last.txt")
+    #emgData = EMGDataHelper("..\\emg_first_last.txt")
     #emgData.doInterp(emgData.data)
     #emgData.doMovingAverage(emgData.data)
     #emgData.doInterp(emgData.data)
@@ -339,6 +379,7 @@ if __name__ == '__main__':
     #emgData.doSavitzkyGolayFilter(emgData.data)
     #emgData.doFreqPlot(emgData.data)
     #emgData.exponentialFilter(emgData.data)
-    #gsrData = GSRDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\new.txt")
-    emgData.splitHeadTail()
+    gsrData = GSRDataHelper("..\\gsr_10mins.txt")
+    gsrData.doOneSpectrum(gsrData.data)
+    #emgData.splitHeadTail()
     #emgData.showTimeFreq()
