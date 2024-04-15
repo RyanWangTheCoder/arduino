@@ -330,9 +330,9 @@ class GSRDataHelper:
 
 
 if __name__ == '__main__':
-    emgData = EMGDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\emg.txt")
+    emgData = EMGDataHelper("..\\emg_first_last.txt")
     #emgData.doInterp(emgData.data)
-    emgData.doMovingAverage(emgData.data)
+    #emgData.doMovingAverage(emgData.data)
     #emgData.doInterp(emgData.data)
     #emgData.doMovingAverage(emgData.data)
     #emgData.doKalmanFilter(emgData.data)
@@ -340,5 +340,5 @@ if __name__ == '__main__':
     #emgData.doFreqPlot(emgData.data)
     #emgData.exponentialFilter(emgData.data)
     #gsrData = GSRDataHelper("C:\\Users\\ryanw\\OneDrive\\Documents\\Arduino\\new.txt")
-    #emgData.splitHeadTail()
-    emgData.showTimeFreq()
+    emgData.splitHeadTail()
+    #emgData.showTimeFreq()
