@@ -343,7 +343,7 @@ class GSRDataHelper:
         with open(file) as file:
             f_tmp = open("tmp.txt", "w")
             for line in file:
-                if len(line) > 8:
+                if len(line) > 14:
                     f_tmp.write(line)
             f_tmp.close()
         file.close()
@@ -379,7 +379,7 @@ if __name__ == '__main__':
     #emgData.doSavitzkyGolayFilter(emgData.data)
     #emgData.doFreqPlot(emgData.data)
     #emgData.exponentialFilter(emgData.data)
-    gsrData = GSRDataHelper("..\\gsr_10mins.txt")
-    gsrData.doOneSpectrum(gsrData.data)
     #emgData.splitHeadTail()
     #emgData.showTimeFreq()
+    gsrData = GSRDataHelper("..\\gsr_10mins.txt")
+    gsrData.doOneSpectrum(gsrData.data)
