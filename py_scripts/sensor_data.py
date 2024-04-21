@@ -381,5 +381,5 @@ if __name__ == '__main__':
     #emgData.exponentialFilter(emgData.data)
     #emgData.splitHeadTail()
     #emgData.showTimeFreq()
-    gsrData = GSRDataHelper("..\\gsr_10mins.txt")
+    gsrData = GSRDataHelper("..\\gsr003.txt")
     gsrData.doOneSpectrum(gsrData.data)
