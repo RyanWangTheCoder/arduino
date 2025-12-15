@@ -19,7 +19,6 @@
   Read more about it here:
 
   https://www.arduino.cc/reference/en/libraries/arduinoble/
-
   Note, before it begins reading the ADC and updating the data,
   It first sets up some BLE stuff:
     1. sets up as a peripheral
