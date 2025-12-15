@@ -1,175 +1,154 @@
+
 /*
-  MyoWare BLE Peripheral Example Code
-  Advancer Technologies, LLC
-  Brian Kaminski
-  8/01/2023
+  MyoWare 2.0 Wireless Shield — RAW EMG Packet Streaming (BLE)
+  - Streams RAW EMG as 20-byte notifications:
+      byte 0   : sequence counter (uint8_t, wraps at 255)
+      bytes 1-18: 9 samples of RAW EMG (uint16_t, little-endian)
+      byte 19  : flags/reserved (0 for now)
 
-  This example sets up a MyoWare 2.0 Wireless Shield, and then reads the ENV, RAW,
-  and REF data from the attached MyoWare 2.0 Muscle Sensor. The MyoWare 2.0
-  Wireless Shield (the Peripheral) sends this data to a second BLE Device
-  (the Central) over BLE.
+  Notes:
+  - Default sample rate: 1000 Hz
+  - Default samples per packet: 9 (fits 20-byte ATT payload at MTU=23)
+  - RAW EMG on MyoWare is band-pass filtered ~20–498 Hz and amplified.
+    You can compute RECT (abs) and ENV (LPF ~3–5 Hz) on the central.
 
-  This MyoWare 2.0 Wireless Shield, aka the "BLE Peripheral", will read the sensor's
-  output on A3-A5 where A3 is ENV, A4 is RAW, and A5 is REF. It will then store
-  them in a single 32-bit variable, and then update that value to the
-  "bluetooth bulletin board". When uploading to the MyoWare 2.0 Wireless Shield
-  make sure to select "ESP32 Dev Module" as the board definition.
-
-  Note, in BLE, you have services, characteristics and values.
-  Read more about it here:
-
-  https://www.arduino.cc/reference/en/libraries/arduinoble/
-  Note, before it begins reading the ADC and updating the data,
-  It first sets up some BLE stuff:
-    1. sets up as a peripheral
-    2. sets up a service and characteristic (the data)
-        -Note, Services and characteristics have unique 128-bit UUID,
-        -These must match the UUIDs in the code on the central device.
-    3. advertises itself
-
-  In order for this example to work, you will need a ESP32 board,
-  and it will need to be programmed with the provided code specific to
-  being a central device, looking for this specific service/characteristic.
-
-  Note, both the service and the characteristic get unique UUIDs.
-
-  The "BLE Central", will subscribe to the MyoWare 2.0 Wireless
-  Shield's charactieristic, read it, and parse it into 4 separate bytes,
-  then print the values to the serial terminal.
-
-  Hardware:
-  MyoWare 2.0 Wireless Shield
-  MyoWare 2.0 Muscle Sensor
-  USB from BLE Device to Computer.
-
-  ** For consistent BT connection follow these steps:
-  ** 1. Reset Peripheral
-  ** 2. Wait 5 seconds
-  ** 3. Reset Central
-  ** 4. Enjoy BT connection
-  **
-  ** ArduinoBLE does not support RE-connecting two devices.
-  ** If you loose connection, you must follow this hardware reset sequence again.
-  **
-  ** ArduinoBLE does not support connecting more than four peripheral devices.
-
-  This example code is in the public domain.
+  Based on MyoWare Arduino library examples (Advancer Technologies).
 */
 
 #include <ArduinoBLE.h>
 #include <MyoWare.h>
 
-const String localName = "MyoWareSensor1";  // recommend making this unique for
-                                            // each Wireless shield (e.g. MyoWareSensor1,
-                                            // MyoWareSensor2, ...)
+// ---------- User-configurable ----------
+const char* kLocalName = "MyoWareSensor1";      // keep same or make unique
+const uint32_t kFs_Hz = 1000;                   // sampling rate (Hz)
+const uint8_t  kSamplesPerPacket = 9;           // 9 * 2 bytes + 1 seq + 1 flags = 20
+// --------------------------------------
 
-MyoWare::OutputType outputType = MyoWare::ENVELOPE; // select which output to print to serial
-                                                    // EMG envelope (ENVELOPE) or Raw EMG (RAW))
-
-// debug parameters
-const bool debugLogging = false;      // set to true for verbose logging
-const bool debugOutput = true;        // set to true to print output values to serial
-
-// MyoWare class object
+// MyoWare class object and I/O config
 MyoWare myoware;
 
-// BLE Service
+// BLE Service/Characteristic (reuse MyoWare UUIDs for compatibility)
 BLEService myoWareService(MyoWareBLE::uuidMyoWareService.c_str());
 
-// BLE Muscle Sensor Characteristics
-BLEStringCharacteristic sensorCharacteristic(MyoWareBLE::uuidMyoWareCharacteristic.c_str(), BLERead | BLENotify, 128);
+// Binary characteristic (20-byte payload)
+BLECharacteristic emgPacketChar(
+  MyoWareBLE::uuidMyoWareCharacteristic.c_str(),
+  BLERead | BLENotify, 20
+);
 
-void setup()
-{
+// Status LED on shield (managed by MyoWare lib)
+const int statusLED = myoware.getStatusLEDPin();
+
+// Sampling state
+volatile uint8_t  seq = 0;
+uint16_t          packetBuf[kSamplesPerPacket];
+uint8_t           bufCount = 0;
+
+// Timing
+uint32_t sampleIntervalUs = (uint32_t)(1000000UL / kFs_Hz);
+uint32_t nextSampleDueUs  = 0;
+
+void setup() {
   Serial.begin(115200);
-  while (!Serial);
+  while (!Serial) { ; }
 
-  myoware.setConvertOutput(false);    // Set to true to convert ADC output to the amplitude of
-                                      // of the muscle activity as it appears at the electrodes
-                                      // in millivolts
-  myoware.setGainPotentiometer(50.);  // Gain potentiometer resistance in kOhms.
-                                      // adjust the potentiometer setting such that the
-                                      // max muscle reading is below 3.3V then update this
-                                      // parameter to the measured value of the potentiometer
-  myoware.setENVPin(A3);              // Arduino pin connected to ENV (defult is A3 for Wireless Shield)
-  myoware.setRAWPin(A4);              // Arduino pin connected to RAW (defult is A4 for Wireless Shield)
-  myoware.setREFPin(A5);              // Arduino pin connected to REF (defult is A5 for Wireless Shield)
+  // MyoWare configuration
+  myoware.setConvertOutput(false); // return ADC-scale values (not mV) for RAW
+  myoware.setGainPotentiometer(50.0f);
+  myoware.setENVPin(A3);  // default pins for Wireless Shield
+  myoware.setRAWPin(A4);
+  myoware.setREFPin(A5);
 
-  pinMode(myoware.getStatusLEDPin(), OUTPUT);  // initialize the built-in LED pin to indicate
-                                               // when a central is connected
-  digitalWrite(myoware.getStatusLEDPin(), HIGH);
+  pinMode(statusLED, OUTPUT);
+  digitalWrite(statusLED, HIGH);   // LED on while waiting for BLE init
 
-  // begin initialization
-  bool error = !BLE.begin();
-  if (error)
-  {
+  // BLE init
+  if (!BLE.begin()) {
     Serial.println("FAILED - BLE Initialization!");
-
-    while (error);
+    while (1) { delay(1000); }
   }
 
-  BLE.setLocalName(localName.c_str());
+  BLE.setLocalName(kLocalName);
   BLE.setAdvertisedService(myoWareService);
-  myoWareService.addCharacteristic(sensorCharacteristic);
+  myoWareService.addCharacteristic(emgPacketChar);
   BLE.addService(myoWareService);
 
-  // set initial values for the characteristics
-  sensorCharacteristic.writeValue("");
+  // Initialize characteristic value (20 bytes of zeros)
+  uint8_t zero[20] = {0};
+  emgPacketChar.writeValue(zero, sizeof(zero));
 
   BLE.advertise();
+  digitalWrite(statusLED, LOW);
 
-  if (debugLogging)
-  {
-    Serial.println("Setup Complete!");
-    Serial.print(BLE.address());
-    Serial.print(" '");
-    Serial.print(localName.c_str());
-    Serial.print("' ");
-    Serial.print(myoWareService.uuid());
-    Serial.println();
-    Serial.print("Waiting to connect...");
-  }
+  // Prepare sampling schedule
+  nextSampleDueUs = micros() + sampleIntervalUs;
 
-  digitalWrite(myoware.getStatusLEDPin(), LOW);
+  Serial.println("MyoWare RAW EMG streaming ready (BLE notify).");
+  Serial.print("LocalName: "); Serial.println(kLocalName);
+  Serial.print("Service UUID: "); Serial.println(myoWareService.uuid());
+  Serial.print("Char UUID: "); Serial.println(emgPacketChar.uuid());
+  Serial.print("Fs: "); Serial.print(kFs_Hz); Serial.println(" Hz");
+  Serial.print("Samples/packet: "); Serial.println(kSamplesPerPacket);
 }
 
-void loop()
-{
-  // wait for a BLE central
+void loop() {
+  // Wait for central
   BLEDevice central = BLE.central();
-  if (central)
-  {
-    if (debugLogging)
-    {
-      Serial.print("Connected to central: ");
-      Serial.println(central.address());
+
+  if (central) {
+    Serial.print("Connected to central: "); Serial.println(central.address());
+    digitalWrite(statusLED, HIGH);
+
+    // Sampling + packetization while connected
+    while (central.connected()) {
+      uint32_t nowUs = micros();
+
+      // Timed sampling (busy-wait to keep jitter low)
+      if ((int32_t)(nowUs - nextSampleDueUs) >= 0) {
+        // Read RAW EMG via MyoWare lib
+        // Returns a number proportional to ADC value; cast to uint16_t for transport.
+        uint16_t raw = (uint16_t)myoware.readSensorOutput(MyoWare::RAW);
+
+        // Buffer the sample
+        if (bufCount < kSamplesPerPacket) {
+          packetBuf[bufCount++] = raw;
+        }
+
+        // Packet ready? Build and notify
+        if (bufCount == kSamplesPerPacket) {
+          uint8_t payload[20];
+          payload[0] = seq++;            // sequence counter
+          // Pack 9 samples, little-endian
+          uint8_t w = 1;
+          for (uint8_t i = 0; i < kSamplesPerPacket; ++i) {
+            uint16_t s = packetBuf[i];
+            payload[w++] = (uint8_t)(s & 0xFF);
+            payload[w++] = (uint8_t)(s >> 8);
+          }
+          payload[19] = 0x00;            // flags/reserved
+
+          // Notify central
+          emgPacketChar.writeValue(payload, sizeof(payload));
+
+          // Reset buffer
+          bufCount = 0;
+        }
+
+        // Schedule next sample
+        nextSampleDueUs += sampleIntervalUs;
+      }
+
+      // Keep BLE stack serviced
+      BLE.poll();
     }
 
-    digitalWrite(myoware.getStatusLEDPin(), HIGH); // turn on the LED to indicate the
-                                                   // connection
-
-    while (central.connected())
-    {
-      // Read sensor output
-      const String strValue = String(myoware.readSensorOutput(outputType));
-      if (debugOutput)
-        Serial.println(strValue.c_str());
-
-      // "post" to "BLE bulletin board"
-      sensorCharacteristic.writeValue(strValue);
-    }
-
-    // when the central disconnects, turn off the LED:
-    digitalWrite(myoware.getStatusLEDPin(), LOW);
-
-    if (debugLogging)
-    {
-      Serial.print("Disconnected from central: ");
-      Serial.println(central.address());
-    }
-  }
-  else
-  {
+    // Central disconnected
+    digitalWrite(statusLED, LOW);
+    Serial.print("Disconnected from central: "); Serial.println(central.address());
+    bufCount = 0; // clear any partial packet
+  } else {
+       // Idle animation
     myoware.blinkStatusLED();
+    BLE.poll();
   }
 }
