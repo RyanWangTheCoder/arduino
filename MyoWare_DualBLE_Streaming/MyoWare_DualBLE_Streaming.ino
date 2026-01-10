@@ -1,234 +1,114 @@
-/*
-  MyoWare BLE UART Example Code
-  Advancer Technologies, LLC
-  Brian Kaminski
-  12/16/2023
 
-  This example sets up a MyoWare 2.0 Wireless Shield to connect to the free app 
-  Bluefruit Connect (https://learn.adafruit.com/bluefruit-le-connect/) from
-  Adafruit Industries. The code reads the ENV, RAW, and REF data from the
-  attached MyoWare 2.0 Muscle Sensor and sends the data to the Bluefruit Connect
-  app over BLE UART.
-
-  This MyoWare 2.0 Wireless Shield, aka the "BLE Server", will read the sensor's
-  output on A3-A5 where A3 is ENV, A4 is RAW, and A5 is REF. It then removes
-  the DC offset from the RAW data using the REF value and notifies the
-  "BLE Client" which is your smartphone running the Bluefruit Connect app.
-  
-  Note, in BLE, you have services, characteristics and values.
-  Read more about BLE here: 
-  https://www.arduino.cc/reference/en/libraries/arduinoble/
-  
-  This example uses Nordic UART Service (NUS) UUIDs for the service and the characteristics.
-  Read more about Nordic UART Service here:
-  https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.sdk5.v14.0.0%2Fble_sdk_app_nus_eval.html
- 
-  Note, before it begins reading the ADC and updating the data,
-  It first sets up some BLE stuff:
-   1. Create a BLE Server
-   2. Create a BLE Service
-   3. Create a BLE Characteristic on the Service
-   4. Create a BLE Descriptor on the characteristic
-   5. Start the service
-   6. Start advertising
-
-  In order for this example to work, you will need a smartphone, with Bluetooth
-  turned on, and the Bluefruit Connect app installed.
-  1. Open the Bluefruit Connect app
-  2. The device list will display all BLE devices discovered by the app
-  3. Find the device named "MyoW1" and connect
-  * The device name is defined by variable shieldDeviceName below
-  * If using multiple MyoWare IoT Shields, use "Multiple UART mode"
-  4. Once connected, you can choose UART or Plotter module to view 
-     incoming data as text or graphically  
-
-  Hardware:
-  MyoWare 2.0 Wireless Shield (or ESP32-based device)
-  MyoWare 2.0 Muscle Sensor
-  Smartphone with Bluefruit Connect app installed
-
-  ** For consistent BT connection follow these steps:
-  ** 1. Reset Server
-  ** 2. Wait 5 seconds
-  ** 3. Reset Client
-  ** 4. Enjoy BT connection
-
-  This example code is in the public domain.
-*/
-
-#include <BLEServer.h>
 #include <BLEDevice.h>
+#include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <MyoWare.h>
 
-// user-definable parameters
-const String myowareShieldName = "MyoWareSensor1"; // device name can be customized
-                                          // and is the name that will show 
-                                          // up in the Bluefruit Connect app's 
-                                          // device list. recommend making this
-                                          // unique for each Wireless shield 
-                                          // (e.g. MyoW1, MyoW2, ...)
+// BLE UUIDs for Nordic UART Service
+#define NUS_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_CHAR_UUID        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_CHAR_UUID        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// debug parameters
-const bool debugLogging = false;     // set to true for verbose logging
-const bool debugOutput = false;      // set to true to print output values to serial
+// Device name
+const char* DEVICE_NAME = "MyoW1";
 
-// MyoWare class object
+// MyoWare object
 MyoWare myoware;
 
-// misc. parameters
+// BLE objects
+BLEServer* pServer = nullptr;
+BLECharacteristic* pTXCharacteristic = nullptr;
 bool isConnected = false;
-bool previousConnected = false;
 
-BLEServer* pServer = NULL;
-BLECharacteristic* pTXCharacteristic = NULL;
-BLECharacteristic* pRXCharacteristic = NULL;
+// Sampling parameters
+const uint16_t SAMPLE_RATE_HZ = 500;       // Target sampling rate
+const uint32_t SAMPLE_INTERVAL_US = 1000000UL / SAMPLE_RATE_HZ; // 2000 µs for 500 Hz
+uint32_t lastSampleMicros = 0;
 
-class ServerCallbacks: public BLEServerCallbacks 
-{
-    void onConnect(BLEServer* pServer) 
-    {
-      isConnected = true;
-    }
-
-    void onDisconnect(BLEServer* pServer) 
-    {
-      isConnected = false;
-    }
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) { isConnected = true; }
+  void onDisconnect(BLEServer* pServer) { isConnected = false; }
 };
 
-void setup() 
-{
+void setup() {
   Serial.begin(115200);
+  delay(500);
 
-  myoware.setConvertOutput(false);    // Set to true to convert ADC output to the amplitude of
-                                      // of the muscle activity as it appears at the electrodes
-                                      // in millivolts
-  myoware.setGainPotentiometer(50.);  // Gain potentiometer resistance in kOhms.
-                                      // adjust the potentiometer setting such that the
-                                      // max muscle reading is below 3.3V then update this
-                                      // parameter to the measured value of the potentiometer
-  myoware.setENVPin(A3);              // Arduino pin connected to ENV (defult is A3 for Wireless Shield)
-  myoware.setRAWPin(A4);              // Arduino pin connected to RAW (defult is A4 for Wireless Shield)
-  myoware.setREFPin(A5);              // Arduino pin connected to REF (defult is A5 for Wireless Shield)
+  // Configure MyoWare pins
+  myoware.setConvertOutput(false); // Keep raw ADC units
+  myoware.setENVPin(A3);
+  myoware.setRAWPin(A4);
+  myoware.setREFPin(A5);
 
-  pinMode(myoware.getStatusLEDPin(), OUTPUT); // initialize the built-in LED pin to indicate 
-                                              // when a central is connected
+  pinMode(myoware.getStatusLEDPin(), OUTPUT);
   digitalWrite(myoware.getStatusLEDPin(), HIGH);
 
-  // Create the BLE Device
-  BLEDevice::init(myowareShieldName.c_str());
-
-  // Create the BLE Server
+  // BLE setup
+  BLEDevice::init(DEVICE_NAME);
   pServer = BLEDevice::createServer();
-  if (!pServer)
-  {
-    Serial.println("Error creating Server!");
-    while(!pServer);
-  }
   pServer->setCallbacks(new ServerCallbacks());
 
-  // Create the BLE Service  
-  BLEService* pService = pServer->createService(MyoWareBLE::uuidUARTService.c_str());
-  if (!pService)
-  {
-    Serial.println("Error creating UART Service!");
-    while(!pService);
-  }
+  BLEService* pService = pServer->createService(NUS_SERVICE_UUID);
 
-  // Create the BLE TX Characteristic
-  pTXCharacteristic = 
-    pService->createCharacteristic(MyoWareBLE::uuidUARTTXCharacteristic.c_str(), 
-                                   BLECharacteristic::PROPERTY_NOTIFY);
-  if (!pTXCharacteristic)
-  {
-    Serial.println("Error creating TX characteristic!");
-    while(!pTXCharacteristic);
-  }
+  pTXCharacteristic = pService->createCharacteristic(
+    NUS_TX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
   pTXCharacteristic->addDescriptor(new BLE2902());
 
-  // Create the BLE RX Characteristic
-  pRXCharacteristic = 
-    pService->createCharacteristic(MyoWareBLE::uuidUARTRXCharacteristic.c_str(), 
-                                   BLECharacteristic::PROPERTY_WRITE);
-  if (!pRXCharacteristic)
-  {
-    Serial.println("Error creating RX characteristic!");
-    while(!pRXCharacteristic);
-  }
+  // RX characteristic (not used now, but created for completeness)
+  pService->createCharacteristic(
+    NUS_RX_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
 
-  // Start the service
   pService->start();
 
-  /// Start advertising
-  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();  
-  pAdvertising->addServiceUUID(MyoWareBLE::uuidUARTService.c_str());
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);  // set value to 0x00 to not advertise this parameter
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   BLEDevice::startAdvertising();
 
-  if (debugLogging)
-  {
-    Serial.println("Setup Complete!");
-    Serial.println("Waiting to connect...");
-  }
-
-  digitalWrite(myoware.getStatusLEDPin(), LOW);
+  Serial.println("BLE advertising started. Waiting for connection...");
 }
 
-void loop() 
-{
-  // if connected... read the sensor value, update the transmit characteristic
-  // value, and notify that the value changed
-  if (isConnected) 
-  {
-    digitalWrite(myoware.getStatusLEDPin(), HIGH); // turn on the LED to indicate the 
-                                                   // connection
+void loop() {
+  uint32_t nowMicros = micros();
+  if (nowMicros - lastSampleMicros >= SAMPLE_INTERVAL_US) {
+    lastSampleMicros = nowMicros;
 
-    // Read sensor output
-    const String strValue = ReadSensorData() + "\n";
-    if (debugOutput)
-      Serial.println(strValue.c_str());
+    // Read sensor values
+    int env = analogRead(A3);
+    int raw = analogRead(A4);
+    int ref = analogRead(A5);
 
-    if (pTXCharacteristic)
-    {
-      pTXCharacteristic->setValue(strValue.c_str());
+    // debug code to print on serial
+    Serial.printf("analogRead ENV=%d RAW=%d REF=%d\n", env, raw, ref);
+
+    Serial.printf("A3(GPIO39)=%d  A4(GPIO32)=%d  A5(GPIO33)=%d\n",
+                analogRead(39), analogRead(32), analogRead(33));
+  
+    uint32_t env_mv = analogReadMilliVolts(39);
+    uint32_t raw_mv = analogReadMilliVolts(32);
+    uint32_t ref_mv = analogReadMilliVolts(33);
+
+    Serial.printf("GPIO ENV=%d (%lumV)  RAW=%d (%lumV)  REF=%d (%lumV)\n",
+                env, env_mv, raw, raw_mv, ref, ref_mv);
+    //
+    if (isConnected && pTXCharacteristic) {
+      // Format as ASCII: RAW,ENV,REF\n
+      char buffer[32];
+      snprintf(buffer, sizeof(buffer), "%d,%d,%d\n", raw, env, ref);
+      pTXCharacteristic->setValue(buffer);
       pTXCharacteristic->notify();
     }
-  }
-  // blink status LED while not connected
-  else
-  {
-    myoware.blinkStatusLED();
-  }
-  
-  // if the shield disconnected, restart advertising and blink the status LED
-  if (!isConnected && previousConnected) 
-  {
-      delay(500);
-      
-      // restart advertising
-      pServer->startAdvertising(); 
-      
-      // blink status LED while not connected
-      if (debugLogging)
-        Serial.println("Waiting to reconnect...");
+
+    // Blink LED if not connected
+    if (!isConnected) {
       myoware.blinkStatusLED();
-      previousConnected = isConnected;
-  }
-  // if the shield just connected, update the previousConnected flag
-  else if (isConnected && !previousConnected) 
-  {
-      previousConnected = isConnected;
+    } else {
+      digitalWrite(myoware.getStatusLEDPin(), HIGH);
+    }
   }
 }
 
-// reads MyoWare Sensor output values and returns them as a comma delimited string
-String ReadSensorData() 
-{
-  const double env = myoware.readSensorOutput(MyoWare::ENVELOPE);
-  const double raw = myoware.readSensorOutput(MyoWare::RAW);
-
-  return String(env) + "," + String(raw);
-}

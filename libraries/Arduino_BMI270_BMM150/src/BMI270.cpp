@@ -9,10 +9,19 @@
 
 static events::EventQueue queue(10 * EVENTS_EVENT_SIZE);
 #endif
+
+#ifdef ARDUINO_ARCH_ESP32
+#include "FunctionalInterrupt.h"
+#endif
+
+#if defined(ARDUINO_NANO33BLE)
+#define TARGET_ARDUINO_NANO33BLE
+#endif
+
 BoschSensorClass::BoschSensorClass(TwoWire& wire)
 {
   _wire = &wire;
-  #ifdef TARGET_ARDUINO_NANO33BLE
+  #if defined(TARGET_ARDUINO_NANO33BLE) && defined(__MBED__)
   BMI270_INT1 = p11;
   #endif
 }
@@ -34,7 +43,46 @@ void BoschSensorClass::onInterrupt(mbed::Callback<void(void)> cb)
   irq.rise(mbed::callback(this, &BoschSensorClass::interrupt_handler));
 }
 #endif
-int BoschSensorClass::begin() {
+
+#ifdef ARDUINO_ARCH_ESP32
+static EventGroupHandle_t xHandle = NULL;
+struct bmi_task_data {
+  BoschSensorClass* imu;
+  struct bmi2_dev* bmi2;
+};
+
+void irq_thread(void *pvParameters)
+{
+  bmi_task_data* instance_ptr = static_cast<bmi_task_data*>(pvParameters);
+  uint16_t status;
+  while (1) {
+    xEventGroupWaitBits(xHandle, 1, pdTRUE, pdFALSE, portMAX_DELAY);
+    if (instance_ptr->imu && instance_ptr->imu->_cb) {
+      bmi2_get_int_status(&status, instance_ptr->bmi2);
+      instance_ptr->imu->_cb();
+    }
+  }
+}
+
+void BoschSensorClass::cb_wrapper()
+{
+  xEventGroupSetBits(xHandle, 0xFF);
+}
+
+void BoschSensorClass::onInterrupt(void (*cb)(void))
+{
+  if (BMI270_INT1 == -1) {
+    return;
+  }
+  xHandle = xEventGroupCreate();
+  _cb = cb;
+  static struct bmi_task_data instance = { this, &bmi2 };
+  pinMode(BMI270_INT1, INPUT_PULLUP);
+  xTaskCreate(irq_thread, "bmi_irq_thread", 4096, &instance, 1, NULL);
+  attachInterrupt(BMI270_INT1, std::bind(&BoschSensorClass::cb_wrapper, this), FALLING);
+}
+#endif
+int BoschSensorClass::begin(CfgBoshSensor_t cfg) {
 
   _wire->begin();
 
@@ -60,34 +108,38 @@ int BoschSensorClass::begin() {
   mag_dev_info._wire = _wire;
   mag_dev_info.dev_addr = bmm1.chip_id;
 
-  int8_t bmi270InitResult = bmi270_init(&bmi2);
-  print_rslt(bmi270InitResult);
+  int8_t result = 0;
 
-  int8_t bmi270ConfigResult = configure_sensor(&bmi2);
-  print_rslt(bmi270ConfigResult);
+  if(cfg != BOSCH_MAGNETOMETER_ONLY) {
 
-  int8_t bmm150InitResult = bmm150_init(&bmm1);
-  print_rslt(bmm150InitResult);
+    result  |= bmi270_init(&bmi2);
+    print_rslt(result);
 
-  int8_t bmm150ConfigResult = configure_sensor(&bmm1);
-  print_rslt(bmm150ConfigResult);
+    result  |= configure_sensor(&bmi2);
+    print_rslt(result);
+  }
 
-  bool success = bmi270InitResult == BMI2_OK && bmi270ConfigResult == BMI2_OK && 
-                  bmm150InitResult == BMM150_OK && bmm150ConfigResult == BMM150_OK;
-  _initialized = success;
+  if(cfg != BOSCH_ACCELEROMETER_ONLY) {
 
-  return success;
+    result |= bmm150_init(&bmm1);
+    print_rslt(result);
+
+    result = configure_sensor(&bmm1);
+    print_rslt(result);
+  }
+
+  _initialized = (result == 0);
+
+  return _initialized;
 }
 
 
 void BoschSensorClass::setContinuousMode() {
-  bmi2_set_fifo_config(BMI2_FIFO_GYR_EN | BMI2_FIFO_ACC_EN, 1, &bmi2);
-  continuousMode = true;
+  continuousMode.begin();
 }
 
 void BoschSensorClass::oneShotMode() {
-  bmi2_set_fifo_config(BMI2_FIFO_GYR_EN | BMI2_FIFO_ACC_EN, 0, &bmi2);
-  continuousMode = false;
+  continuousMode.end();
 }
 
 // default range is +-4G, so conversion factor is (((1 << 15)/4.0f))
@@ -96,7 +148,14 @@ void BoschSensorClass::oneShotMode() {
 // Accelerometer
 int BoschSensorClass::readAcceleration(float& x, float& y, float& z) {
   struct bmi2_sens_data sensor_data;
-  auto ret = bmi2_get_sensor_data(&sensor_data, &bmi2);
+  int ret = 0;
+
+  if (continuousMode.hasData(BMI270_ACCELEROMETER)) {
+    continuousMode.getAccelerometerData(&sensor_data.acc);
+  } else {
+    ret = bmi2_get_sensor_data(&sensor_data, &bmi2);
+  }
+
   #ifdef TARGET_ARDUINO_NANO33BLE
   x = -sensor_data.acc.y / INT16_to_G;
   y = -sensor_data.acc.x / INT16_to_G;
@@ -110,11 +169,14 @@ int BoschSensorClass::readAcceleration(float& x, float& y, float& z) {
 
 int BoschSensorClass::accelerationAvailable() {
   uint16_t status;
+  if (continuousMode) {
+    return continuousMode.available(BMI270_ACCELEROMETER);
+  }
   bmi2_get_int_status(&status, &bmi2);
   int ret = ((status | _int_status) & BMI2_ACC_DRDY_INT_MASK);
   _int_status = status;
   _int_status &= ~BMI2_ACC_DRDY_INT_MASK;
-  return ret;
+  return ret > 0;
 }
 
 float BoschSensorClass::accelerationSampleRate() {
@@ -130,7 +192,13 @@ float BoschSensorClass::accelerationSampleRate() {
 // Gyroscope
 int BoschSensorClass::readGyroscope(float& x, float& y, float& z) {
   struct bmi2_sens_data sensor_data;
-  auto ret = bmi2_get_sensor_data(&sensor_data, &bmi2);
+  int ret = 0;
+
+  if (continuousMode.hasData(BMI270_GYROSCOPE)) {
+    continuousMode.getGyroscopeData(&sensor_data.gyr);
+  } else {
+    ret = bmi2_get_sensor_data(&sensor_data, &bmi2);
+  }
   #ifdef TARGET_ARDUINO_NANO33BLE
   x = -sensor_data.gyr.y / INT16_to_DPS;
   y = -sensor_data.gyr.x / INT16_to_DPS;
@@ -144,11 +212,14 @@ int BoschSensorClass::readGyroscope(float& x, float& y, float& z) {
 
 int BoschSensorClass::gyroscopeAvailable() {
   uint16_t status;
+  if (continuousMode) {
+    return continuousMode.available(BMI270_GYROSCOPE);
+  }
   bmi2_get_int_status(&status, &bmi2);
   int ret = ((status | _int_status) & BMI2_GYR_DRDY_INT_MASK);
   _int_status = status;
   _int_status &= ~BMI2_GYR_DRDY_INT_MASK;
-  return ret;
+  return ret > 0;
 }
 
 float BoschSensorClass::gyroscopeSampleRate() {
@@ -276,7 +347,7 @@ int8_t BoschSensorClass::configure_sensor(struct bmm150_dev *dev)
 
 int8_t BoschSensorClass::bmi2_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr)
 {
-  if ((reg_data == NULL) || (len == 0) || (len > 32)) {
+  if ((reg_data == NULL) || (len == 0) || (len > 250)) {
     return -1;
   }
   uint8_t bytes_received;
@@ -302,7 +373,7 @@ int8_t BoschSensorClass::bmi2_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint
 
 int8_t BoschSensorClass::bmi2_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr)
 {
-  if ((reg_data == NULL) || (len == 0) || (len > 32)) {
+  if ((reg_data == NULL) || (len == 0) || (len > 250)) {
     return -1;
   }
 
@@ -310,10 +381,7 @@ int8_t BoschSensorClass::bmi2_i2c_write(uint8_t reg_addr, const uint8_t *reg_dat
   uint8_t dev_id = dev_info->dev_addr;
   dev_info->_wire->beginTransmission(dev_id);
   dev_info->_wire->write(reg_addr);
-  for (uint16_t i = 0; i < len; i++)
-  {
-    dev_info->_wire->write(reg_data[i]);
-  }
+  dev_info->_wire->write(reg_data, (size_t)len);
   if (dev_info->_wire->endTransmission() != 0) {
     return -1;
   }
@@ -339,6 +407,7 @@ static void panic_led_trap(void)
   static int const LED_BUILTIN = 2;
 #endif
 
+#if !defined(ARDUINO_ARDUINO_NESSO_N1)
   pinMode(LED_BUILTIN, OUTPUT);
   while (1)
   {
@@ -347,6 +416,7 @@ static void panic_led_trap(void)
     digitalWrite(LED_BUILTIN, HIGH);
     delay(100);
   }
+#endif
 }
 
 void BoschSensorClass::print_rslt(int8_t rslt)
