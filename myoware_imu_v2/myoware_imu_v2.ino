@@ -8,9 +8,6 @@
 #include <MyoWare.h>
 #include "ICM_20948.h"
 
-bool send_emg_frame(uint16_t maxPayload);
-bool send_imu_frame(uint16_t maxPayload);
-
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX_CHAR_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX_CHAR_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -27,9 +24,8 @@ static constexpr uint32_t IMU_RATE_HZ = 200;
 static constexpr uint32_t EMG_PERIOD_US = 1000000UL / EMG_RATE_HZ;
 static constexpr uint32_t IMU_PERIOD_US = 1000000UL / IMU_RATE_HZ;
 
-
-static constexpr uint16_t EMG_BUF_SIZE = 2048; // ~1s at 2kHz
-static constexpr uint16_t IMU_BUF_SIZE = 512;  // ~2.5s at 200Hz
+static constexpr uint16_t EMG_BUF_SIZE = 2048;
+static constexpr uint16_t IMU_BUF_SIZE = 512;
 
 static constexpr uint32_t HEALTH_REPORT_MS = 1000;
 
@@ -182,7 +178,6 @@ void imuTask(void* /*param*/) {
   }
 }
 
-
 static uint32_t frameSeq = 0;
 
 static inline void wr_u16(uint8_t*& p, uint16_t v) { *p++ = v & 0xFF; *p++ = v >> 8; }
@@ -204,9 +199,8 @@ static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc = 0xFF
   return crc;
 }
 
-
 bool send_emg_frame(uint16_t maxPayload) {
-  const uint16_t headerBytes = 14; // FrameHeader
+  const uint16_t headerBytes = 14;
   const uint16_t tlvHdrBytes = 3;
   const uint16_t emgMetaBytes = 13;
   const uint16_t crcBytes = 2;
@@ -228,16 +222,17 @@ bool send_emg_frame(uint16_t maxPayload) {
   uint8_t buf[512];
   uint8_t* p = buf;
 
-  // Frame header
+  // Header
   p[0] = MAGIC0; p[1] = MAGIC1; p[2] = PROTO_VER; p[3] = FLAG_CRC16;
   wr_u32(p += 4, frameSeq++);
   wr_u32(p, micros());
   wr_u16(p, 0); // payload_len placeholder
-  // ❌ DO NOT DO: p += 2;
+  uint8_t* payload_start = buf + headerBytes;
+  p = payload_start;
 
-  // TLV header (starts exactly at offset 14)
+  // TLV header
   *p++ = TLV_EMG_BATCH;
-  wr_u16(p, 0); // TLV len placeholder
+  wr_u16(p, 0);
   uint8_t* tlvLenPos = p - 2;
 
   // EMG meta
@@ -246,9 +241,9 @@ bool send_emg_frame(uint16_t maxPayload) {
   if (off > 32767) off = 32767; if (off < -32768) off = -32768;
   wr_i16(p, (int16_t)off);
   wr_u16(p, EMG_RATE_HZ);
-  *p++ = 3; // channels
-  *p++ = REF_CONNECTED ? 0x07 : 0x03; // valid_mask
-  *p++ = 0; // format
+  *p++ = 3;
+  *p++ = REF_CONNECTED ? 0x07 : 0x03;
+  *p++ = 0;
   wr_u16(p, N);
 
   for (uint16_t i = 0; i < N; i++) {
@@ -261,7 +256,7 @@ bool send_emg_frame(uint16_t maxPayload) {
   tlvLenPos[0] = tlvLen & 0xFF;
   tlvLenPos[1] = tlvLen >> 8;
 
-  uint16_t payloadLen = tlvHdrBytes + tlvLen;
+  uint16_t payloadLen = (uint16_t)(p - payload_start);
   buf[12] = payloadLen & 0xFF;
   buf[13] = payloadLen >> 8;
 
@@ -305,8 +300,9 @@ bool send_imu_frame(uint16_t maxPayload) {
   p[0] = MAGIC0; p[1] = MAGIC1; p[2] = PROTO_VER; p[3] = FLAG_CRC16;
   wr_u32(p += 4, frameSeq++);
   wr_u32(p, micros());
-  wr_u16(p, 0); // payload_len placeholder
-  // ❌ DO NOT DO: p += 2;
+  wr_u16(p, 0);
+  uint8_t* payload_start = buf + headerBytes;
+  p = payload_start;
 
   *p++ = TLV_IMU_BATCH;
   wr_u16(p, 0);
@@ -318,8 +314,8 @@ bool send_imu_frame(uint16_t maxPayload) {
   wr_i16(p, (int16_t)off);
   wr_u16(p, IMU_RATE_HZ);
   *p++ = N;
-  *p++ = 0; // format
-  wr_u16(p, 0x003F); // axes_mask
+  *p++ = 0;
+  wr_u16(p, 0x003F);
 
   for (uint16_t i = 0; i < N; i++) {
     wr_i16(p, batch[i].ax);
@@ -334,7 +330,7 @@ bool send_imu_frame(uint16_t maxPayload) {
   tlvLenPos[0] = tlvLen & 0xFF;
   tlvLenPos[1] = tlvLen >> 8;
 
-  uint16_t payloadLen = tlvHdrBytes + tlvLen;
+  uint16_t payloadLen = (uint16_t)(p - payload_start);
   buf[12] = payloadLen & 0xFF;
   buf[13] = payloadLen >> 8;
 
@@ -354,7 +350,7 @@ bool send_imu_frame(uint16_t maxPayload) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("Harden v2 starting...");
+  Serial.println("MyoWare BLE starting...");
 
   analogReadResolution(12);
   Wire.begin();
@@ -393,24 +389,28 @@ void setup() {
   Serial.printf("Timers started: EMG=%lu Hz, IMU=%lu Hz\n", EMG_RATE_HZ, IMU_RATE_HZ);
 }
 
-/******************** Loop ********************/
 void loop() {
   static uint32_t lastHealthMs = 0;
   static uint32_t framesSent = 0;
   static uint32_t lastFramesSent = 0;
 
   if (isConnected && pTXCharacteristic) {
+    bool sent = false;
+
     // Send EMG aggressively
-    send_emg_frame(maxNotifyPayload);
-    // Send IMU every ~20ms
+    sent |= send_emg_frame(maxNotifyPayload);
+
+    // Send IMU every ~20ms (but skip if EMG backlog is high)
     static uint32_t lastImuSendMs = 0;
-    if (millis() - lastImuSendMs >= 20) {
+    if (millis() - lastImuSendMs >= 20 && emg_available() < EMG_BUF_SIZE * 3 / 4) {
       lastImuSendMs = millis();
-      send_imu_frame(maxNotifyPayload);
+      sent |= send_imu_frame(maxNotifyPayload);
     }
-    framesSent++;
+
+    if (sent) framesSent++;
   }
 
+  // Health report every second
   if (millis() - lastHealthMs >= HEALTH_REPORT_MS) {
     lastHealthMs = millis();
     uint32_t fps = framesSent - lastFramesSent;
@@ -420,6 +420,7 @@ void loop() {
                   (unsigned long)emgDropped, (unsigned long)imuDropped, (unsigned long)fps);
   }
 
+  // Handle disconnect/reconnect
   if (!isConnected && previousConnected) {
     Serial.println("Disconnected. Restarting advertising...");
     delay(200);

@@ -5,7 +5,7 @@ MyoWare BLE Binary Stream Client (EMG + IMU)
 --------------------------------------------
 - Connects to Nordic UART Service (NUS)
 - Parses binary frames with TLV records
-- Logs EMG + IMU to CSV
+- Logs EMG + IMU to rotating CSV files
 - Real-time plots: EMG raw + envelope, IMU magnitude
 """
 
@@ -13,6 +13,7 @@ import asyncio
 import struct
 import time
 import csv
+import os
 from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
@@ -29,7 +30,22 @@ CRC_LEN = 2
 TLV_EMG_BATCH = 0x01
 TLV_IMU_BATCH = 0x02
 
-CSV_FILE = "emg_imu_log.csv"
+# CSV rotation settings
+MAX_ROWS = 200000
+file_idx = 0
+row_count = 0
+
+def open_csv():
+    global file_idx, row_count
+    fname = f"emg_imu_log_{file_idx:03d}.csv"
+    f = open(fname, "w", newline="", encoding="utf-8")
+    w = csv.writer(f)
+    w.writerow(["ts_ms","env","raw","ref","ax","ay","az","gx","gy","gz"])
+    print(f"[CSV] Logging to {fname}")
+    row_count = 0
+    return f, w
+
+csv_file, writer = open_csv()
 
 # Plot buffers
 EMG_RING = deque(maxlen=5000)
@@ -77,9 +93,7 @@ class FrameParser:
             magic0, magic1, ver, flags, frame_seq, t_us, payload_len = struct.unpack_from("<BBBBIIH", self.buf, 0)
             total_len = HEADER_LEN + payload_len + CRC_LEN
             if len(self.buf) < total_len:
-                # Wait for more data
                 break
-            # Now we have full frame
             frame_bytes = bytes(self.buf[:total_len])
             del self.buf[:total_len]
             if flags & 0x01:
@@ -87,9 +101,8 @@ class FrameParser:
                 rx_crc = struct.unpack_from("<H", frame_bytes, len(frame_bytes) - 2)[0]
                 calc_crc = crc16_ccitt(pre_crc)
                 if calc_crc != rx_crc:
-                    print(f"CRC error (calc={calc_crc:04X}, rx={rx_crc:04X}), skipping frame")
+                    print(f"[WARN] CRC error (calc={calc_crc:04X}, rx={rx_crc:04X}), skipping frame")
                     continue
-            # Parse TLVs
             payload = frame_bytes[HEADER_LEN:HEADER_LEN + payload_len]
             tlvs = []
             off = 0
@@ -104,7 +117,6 @@ class FrameParser:
                 tlvs.append((tlv_type, tlv_val))
             frames.append((frame_seq, t_us, tlvs))
         return frames
-
 
 def decode_emg(val):
     emg_seq0, t0_off, sr_hz = struct.unpack_from("<IhH", val, 0)
@@ -130,25 +142,24 @@ async def main():
         try:
             await client.request_mtu(247)
         except Exception:
-            print("MTU request not supported on this platform.")
+            print("[INFO] MTU request not supported on this platform.")
         print("Connected. Subscribing...")
         parser = FrameParser()
-        csv_file = open(CSV_FILE, "w", newline="", encoding="utf-8")
-        writer = csv.writer(csv_file)
-        writer.writerow(["ts_ms","env","raw","ref","ax","ay","az","gx","gy","gz"])
         fs_emg = 2000
         env_filter = ButterLPF(fs_emg)
+
+        # Plot setup
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
         emg_line, = ax1.plot([], [], lw=1.0, label="EMG RAW")
         env_line, = ax1.plot([], [], lw=1.5, label="Envelope")
         imu_line, = ax2.plot([], [], lw=1.2, label="IMU |acc|")
         ax1.legend(); ax2.legend()
+
         def update_plot(_):
             if len(EMG_RING) > 0:
                 t = np.arange(len(EMG_RING)) / fs_emg
                 emg_line.set_data(t, list(EMG_RING))
                 env_line.set_data(t, list(ENV_RING))
-                #env_line.set_data(t, [env_filter.update(abs(x)) for x in EMG_RING])
                 ax1.set_xlim(max(0, t[-1]-2), t[-1])
                 ax1.set_ylim(0, max(1, max(EMG_RING)*1.1))
             if len(IMU_RING) > 0:
@@ -156,25 +167,25 @@ async def main():
                 ax2.set_xlim(0, len(IMU_RING))
                 ax2.set_ylim(0, max(1, max(IMU_RING)*1.1))
             return emg_line, env_line, imu_line
+
         ani = FuncAnimation(fig, update_plot, interval=100, cache_frame_data=False)
         plt.tight_layout()
         plt.show(block=False)
+
         def handle(_, data):
-            print(f"Received {len(data)} bytes")
+            global csv_file, writer, row_count, file_idx
             frames = parser.feed(data)
-            print(f"Parsed {len(frames)} frames")
             for _, _, tlvs in frames:
                 emg_samples = None
                 imu_samples = None
                 for t, v in tlvs:
                     if t not in KNOWN:
-                        # print once per minute to avoid spam
-                        print(f"Unknown TLV type={t:#x}")
+                        print(f"[DEBUG] Unknown TLV type={t:#x}")
                     if t == TLV_EMG_BATCH:
                         _, _, emg_samples = decode_emg(v)
                         for s in emg_samples:
                             raw = int(s[1])
-                            EMG_RING.append(raw)  # RAW channel
+                            EMG_RING.append(raw)
                             ENV_RING.append(env_filter.update(abs(raw)))
                     elif t == TLV_IMU_BATCH:
                         _, _, imu_samples = decode_imu(v)
@@ -183,8 +194,9 @@ async def main():
                             IMU_RING.append(mag)
                 if emg_samples is not None or imu_samples is not None:
                     ts_ms = int(time.time()*1000)
-                    for i in range(max(len(emg_samples) if emg_samples is not None else 0,
-                                       len(imu_samples) if imu_samples is not None else 0)):
+                    max_len = max(len(emg_samples) if emg_samples is not None else 0,
+                                  len(imu_samples) if imu_samples is not None else 0)
+                    for i in range(max_len):
                         env = emg_samples[i][0] if emg_samples is not None and i < len(emg_samples) else ""
                         raw = emg_samples[i][1] if emg_samples is not None and i < len(emg_samples) else ""
                         ref = emg_samples[i][2] if emg_samples is not None and i < len(emg_samples) else ""
@@ -195,16 +207,19 @@ async def main():
                         gy = imu_samples[i][4] if imu_samples is not None and i < len(imu_samples) else ""
                         gz = imu_samples[i][5] if imu_samples is not None and i < len(imu_samples) else ""
                         writer.writerow([ts_ms, env, raw, ref, ax, ay, az, gx, gy, gz])
+                        row_count += 1
+                        if row_count >= MAX_ROWS:
+                            csv_file.close()
+                            file_idx += 1
+                            csv_file, writer = open_csv()
                     csv_file.flush()
+
         await client.start_notify(NUS_TX_UUID, handle)
         print("Streaming... Press Ctrl+C to stop.")
         try:
             while True:
                 await asyncio.sleep(0.1)
-                plt.pause(0.001)  # allow GUI to process events
-        except KeyboardInterrupt:
-            pass
-
+                plt.pause(0.001)
         except KeyboardInterrupt:
             pass
         await client.stop_notify(NUS_TX_UUID)
