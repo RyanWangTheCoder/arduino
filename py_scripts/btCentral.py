@@ -1,410 +1,214 @@
 
 #!/usr/bin/env python3
 """
-MyoWare BLE Central for Fatigue Analysis with Bandpass Filtering
------------------------------------------------------------------
+MyoWare BLE Binary Stream Client (EMG + IMU)
+--------------------------------------------
 - Connects to Nordic UART Service (NUS)
-- Receives ASCII lines: ENV,RAW (updated: no REF)
-- Computes PC envelopes (Butterworth & RMS)
-- Applies bandpass filter (20–450 Hz) before MDF/MNF
-- Logs CSV: ts_ms, env_shield, raw, env_pc_butter, env_pc_rms, mdf, mnf
-- Real-time plotting: RAW + PC Butterworth envelope + PC RMS envelope + Shield ENV (top), MDF/MNF trend (bottom)
+- Parses binary frames with TLV records
+- Logs EMG + IMU to CSV
+- Real-time plots: EMG raw + envelope, IMU magnitude
 """
 
 import asyncio
-import argparse
+import struct
 import time
 import csv
-import os
-import sys
 from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-
-try:
-    from scipy.signal import butter, lfilter, lfilter_zi, get_window, filtfilt
-    SCIPY_AVAILABLE = True
-except Exception:
-    SCIPY_AVAILABLE = False
-
 from bleak import BleakScanner, BleakClient
-from bleak.backends.characteristic import BleakGATTCharacteristic
 
-# Nordic UART Service UUIDs
+# UUIDs
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-NUS_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-# Bandpass filter for EMG
-def bandpass_filter(x, fs, low=20.0, high=450.0, order=4):
-    if not SCIPY_AVAILABLE or len(x) < order * 3:
-        return x  # fallback: no filtering
-    nyq = fs / 2.0
-    low = low / nyq
-    high = high / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return filtfilt(b, a, x)
+MAGIC = b"\xA5\x5A"
+HEADER_LEN = 14
+CRC_LEN = 2
+TLV_EMG_BATCH = 0x01
+TLV_IMU_BATCH = 0x02
 
-# Envelope filters
+CSV_FILE = "emg_imu_log.csv"
+
+# Plot buffers
+EMG_RING = deque(maxlen=5000)
+ENV_RING = deque(maxlen=5000)
+IMU_RING = deque(maxlen=5000)
+
+# Filters for EMG envelope
 class ButterLPF:
-    def __init__(self, fs: float, cutoff: float = 3.6):
-        self.fs = max(1e-3, float(fs))
-        self.cutoff = float(cutoff)
-        self._use_scipy = SCIPY_AVAILABLE
-        self._init_filter()
-        self._zi = None
-        if self._use_scipy:
-            self._zi = lfilter_zi(self._b, self._a) * 0.0
-        self._y_prev = 0.0
+    def __init__(self, fs, cutoff=3.6):
+        from scipy.signal import butter, lfilter_zi
+        self.b, self.a = butter(2, cutoff / (fs / 2.0), btype='low')
+        self.zi = lfilter_zi(self.b, self.a) * 0.0
+    def update(self, x):
+        from scipy.signal import lfilter
+        y, self.zi = lfilter(self.b, self.a, [x], zi=self.zi)
+        return float(max(y[0], 0.0))
 
-    def _init_filter(self):
-        if self._use_scipy:
-            Wn = self.cutoff / (self.fs / 2.0)
-            self._b, self._a = butter(2, Wn, btype='low')
-        else:
-            self._alpha = np.exp(-2.0 * np.pi * self.cutoff / self.fs)
+# CRC16
+def crc16_ccitt(data, crc=0xFFFF):
+    for b in data:
+        crc ^= (b << 8) & 0xFFFF
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc & 0xFFFF
 
-    def set_fs(self, fs: float):
-        fs = max(1e-3, float(fs))
-        if abs(fs - self.fs) / self.fs > 0.05:
-            self.fs = fs
-            self._init_filter()
-            self._y_prev = 0.0
-            if self._use_scipy:
-                self._zi = lfilter_zi(self._b, self._a) * 0.0
-
-    def update(self, x: float) -> float:
-        if self._use_scipy:
-            y, self._zi = lfilter(self._b, self._a, [x], zi=self._zi)
-            return float(max(y[0], 0.0))
-        y = (1.0 - self._alpha) * x + self._alpha * self._y_prev
-        self._y_prev = y
-        return float(max(y, 0.0))
-
-class RMSWindow:
-    def __init__(self, fs: float, win_ms: float = 50.0):
-        self.fs = max(1e-3, float(fs))
-        self.win_ms = float(win_ms)
-        self._N = max(1, int(round(self.fs * self.win_ms / 1000.0)))
-        self._buf = deque(maxlen=self._N)
-        self._sumsq = 0.0
-
-    def set_fs(self, fs: float):
-        fs = max(1e-3, float(fs))
-        if abs(fs - self.fs) / self.fs > 0.05:
-            self.fs = fs
-            self._N = max(1, int(round(self.fs * self.win_ms / 1000.0)))
-            self._buf = deque(maxlen=self._N)
-            self._sumsq = 0.0
-
-    def update(self, x: float) -> float:
-        if len(self._buf) == self._buf.maxlen:
-            old = self._buf[0]
-            self._sumsq -= old * old
-        self._buf.append(x)
-        self._sumsq += x * x
-        denom = max(1, len(self._buf))
-        return float(np.sqrt(self._sumsq / denom))
-
-# Spectral features
-def median_mean_frequency(x: np.ndarray, fs: float) -> tuple:
-    n = len(x)
-    if n < 16:
-        return (np.nan, np.nan)
-    if SCIPY_AVAILABLE:
-        w = get_window('hamming', n, fftbins=True)
-    else:
-        w = np.hamming(n)
-    X = np.fft.rfft(x * w)
-    freqs = np.fft.rfftfreq(n, d=1.0/fs)
-    Pxx = (np.abs(X) ** 2) / (np.sum(w**2))
-    total = np.sum(Pxx)
-    if total <= 0:
-        return (np.nan, np.nan)
-    cumsum = np.cumsum(Pxx)
-    idx = np.searchsorted(cumsum, 0.5 * total)
-    mdf = freqs[min(idx, len(freqs)-1)]
-    mnf = float(np.sum(freqs * Pxx) / total)
-    return (mdf, mnf)
-
-# Line parser
-class LineParser:
+# Frame parser
+class FrameParser:
     def __init__(self):
-        self._buf = bytearray()
-    def feed(self, data: bytes):
-        self._buf.extend(data)
-        lines = []
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf.extend(data)
+        frames = []
         while True:
-            i = self._buf.find(b"\n")
-            if i == -1:
+            i = self.buf.find(MAGIC)
+            if i < 0:
+                if len(self.buf) > 1:
+                    del self.buf[:-1]
                 break
-            raw = self._buf[:i]
-            del self._buf[:i+1]
-            if raw.endswith(b"\r"):
-                raw = raw[:-1]
-            try:
-                line = raw.decode('utf-8', errors='ignore').strip()
-            except Exception:
-                line = ''
-            if line:
-                lines.append(line)
-        return lines
-
-# Ring buffer
-class Ring:
-    def __init__(self, maxlen: int):
-        self.maxlen = maxlen
-        self.buf = np.zeros(maxlen, dtype=np.float32)
-        self.idx = 0
-        self.filled = False
-    def append_many(self, values):
-        vals = np.asarray(values, dtype=np.float32)
-        n = len(vals)
-        end = self.idx + n
-        if end <= self.maxlen:
-            self.buf[self.idx:end] = vals
-        else:
-            first = self.maxlen - self.idx
-            self.buf[self.idx:] = vals[:first]
-            self.buf[:end % self.maxlen] = vals[first:]
-        self.idx = (self.idx + n) % self.maxlen
-        if n >= self.maxlen or end >= self.maxlen:
-            self.filled = True
-    def view_latest(self, n):
-        if n >= self.maxlen or not self.filled:
-            return self.buf.copy() if self.filled else self.buf[:self.idx].copy()
-        start = (self.idx - n) % self.maxlen
-        if start + n <= self.maxlen:
-            return self.buf[start:start+n].copy()
-        part1 = self.buf[start:]
-        part2 = self.buf[:(start+n) % self.maxlen]
-        return np.concatenate([part1, part2])
-
-async def find_device_by_name(name: str):
-    def match(device, adv):
-        try:
-            if name and device.name == name:
-                return True
-            if NUS_SERVICE_UUID.lower() in (adv.service_uuids or []):
-                return True
-        except Exception:
-            pass
-        return False
-    try:
-        device = await BleakScanner.find_device_by_filter(match)
-        return device
-    except Exception:
-        devices = await BleakScanner.discover()
-        return next((d for d in devices if d.name == name), None)
-
-async def run_once(args, backoff_s: float):
-    target = await find_device_by_name(args.name)
-    if not target:
-        print("Device not found.")
-        await asyncio.sleep(backoff_s)
-        return False
-
-    print(f"Connecting to: {target.address}: {target.name}")
-    disconnected = asyncio.Event()
-
-    def on_disconnect(_client: BleakClient):
-        print("Disconnected.")
-        disconnected.set()
-
-    try:
-        async with BleakClient(target, disconnected_callback=on_disconnect) as client:
-            ch_uuid = args.char if args.char else NUS_TX_UUID
-            ch_obj = None
-            for svc in client.services:
-                for ch in svc.characteristics:
-                    if str(ch.uuid).lower() == ch_uuid.lower():
-                        ch_obj = ch
-                        break
-                if ch_obj:
+            if i > 0:
+                del self.buf[:i]
+            if len(self.buf) < HEADER_LEN:
+                break
+            # Peek header
+            magic0, magic1, ver, flags, frame_seq, t_us, payload_len = struct.unpack_from("<BBBBIIH", self.buf, 0)
+            total_len = HEADER_LEN + payload_len + CRC_LEN
+            if len(self.buf) < total_len:
+                # Wait for more data
+                break
+            # Now we have full frame
+            frame_bytes = bytes(self.buf[:total_len])
+            del self.buf[:total_len]
+            if flags & 0x01:
+                pre_crc = frame_bytes[:-2]
+                rx_crc = struct.unpack_from("<H", frame_bytes, len(frame_bytes) - 2)[0]
+                calc_crc = crc16_ccitt(pre_crc)
+                if calc_crc != rx_crc:
+                    print(f"CRC error (calc={calc_crc:04X}, rx={rx_crc:04X}), skipping frame")
+                    continue
+            # Parse TLVs
+            payload = frame_bytes[HEADER_LEN:HEADER_LEN + payload_len]
+            tlvs = []
+            off = 0
+            while off + 3 <= len(payload):
+                tlv_type = payload[off]
+                tlv_len = struct.unpack_from("<H", payload, off + 1)[0]
+                off += 3
+                if off + tlv_len > len(payload):
                     break
-            if not ch_obj:
-                print("TX characteristic not found.")
-                return False
+                tlv_val = payload[off:off + tlv_len]
+                off += tlv_len
+                tlvs.append((tlv_type, tlv_val))
+            frames.append((frame_seq, t_us, tlvs))
+        return frames
 
-            parser = LineParser()
-            fs_user = float(args.fs) if args.fs > 0 else 0.0
-            fs_est = float(fs_user or 100.0)
-            ts_hist = deque(maxlen=200)
-            env_butter = ButterLPF(fs=fs_est, cutoff=args.cutoff)
-            env_rms = RMSWindow(fs=fs_est, win_ms=args.win)
 
-            raw_ring = Ring(maxlen=int(max(200, fs_est * 10)))
-            env_shield_ring = Ring(maxlen=int(max(200, fs_est * 10)))
-            env_pc_ring = Ring(maxlen=int(max(200, fs_est * 10)))
-            env_rms_ring = Ring(maxlen=int(max(200, fs_est * 10)))
+def decode_emg(val):
+    emg_seq0, t0_off, sr_hz = struct.unpack_from("<IhH", val, 0)
+    channels = val[8]
+    count = struct.unpack_from("<H", val, 11)[0]
+    samples = np.frombuffer(val[13:], dtype="<u2").reshape(count, channels)
+    return emg_seq0, sr_hz, samples
 
-            window_sec = 1.0
-            window_samples = int(max(16, fs_est * window_sec))
-            last_feature = time.time()
+def decode_imu(val):
+    imu_seq0, t0_off, sr_hz = struct.unpack_from("<IhH", val, 0)
+    count = val[8]
+    samples = np.frombuffer(val[12:], dtype="<i2").reshape(count, 6)
+    return imu_seq0, sr_hz, samples
 
-            csv_writer = None
-            csv_file = None
-            if args.save:
-                existed = os.path.exists(args.save) and os.path.getsize(args.save) > 0
-                csv_file = open(args.save, 'a', newline='', encoding='utf-8')
-                csv_writer = csv.writer(csv_file)
-                if not existed:
-                    csv_writer.writerow(['ts_ms','env_shield','raw','env_pc_butter','env_pc_rms','mdf','mnf'])
+async def main():
+    KNOWN = {TLV_EMG_BATCH, TLV_IMU_BATCH}
+    device = await BleakScanner.find_device_by_filter(lambda d, adv: NUS_SERVICE_UUID.lower() in (adv.service_uuids or []))
+    if not device:
+        print("Device not found.")
+        return
+    print(f"Connecting to {device.address}...")
+    async with BleakClient(device) as client:
+        try:
+            await client.request_mtu(247)
+        except Exception:
+            print("MTU request not supported on this platform.")
+        print("Connected. Subscribing...")
+        parser = FrameParser()
+        csv_file = open(CSV_FILE, "w", newline="", encoding="utf-8")
+        writer = csv.writer(csv_file)
+        writer.writerow(["ts_ms","env","raw","ref","ax","ay","az","gx","gy","gz"])
+        fs_emg = 2000
+        env_filter = ButterLPF(fs_emg)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
+        emg_line, = ax1.plot([], [], lw=1.0, label="EMG RAW")
+        env_line, = ax1.plot([], [], lw=1.5, label="Envelope")
+        imu_line, = ax2.plot([], [], lw=1.2, label="IMU |acc|")
+        ax1.legend(); ax2.legend()
+        def update_plot(_):
+            if len(EMG_RING) > 0:
+                t = np.arange(len(EMG_RING)) / fs_emg
+                emg_line.set_data(t, list(EMG_RING))
+                env_line.set_data(t, list(ENV_RING))
+                #env_line.set_data(t, [env_filter.update(abs(x)) for x in EMG_RING])
+                ax1.set_xlim(max(0, t[-1]-2), t[-1])
+                ax1.set_ylim(0, max(1, max(EMG_RING)*1.1))
+            if len(IMU_RING) > 0:
+                imu_line.set_data(range(len(IMU_RING)), IMU_RING)
+                ax2.set_xlim(0, len(IMU_RING))
+                ax2.set_ylim(0, max(1, max(IMU_RING)*1.1))
+            return emg_line, env_line, imu_line
+        ani = FuncAnimation(fig, update_plot, interval=100, cache_frame_data=False)
+        plt.tight_layout()
+        plt.show(block=False)
+        def handle(_, data):
+            print(f"Received {len(data)} bytes")
+            frames = parser.feed(data)
+            print(f"Parsed {len(frames)} frames")
+            for _, _, tlvs in frames:
+                emg_samples = None
+                imu_samples = None
+                for t, v in tlvs:
+                    if t not in KNOWN:
+                        # print once per minute to avoid spam
+                        print(f"Unknown TLV type={t:#x}")
+                    if t == TLV_EMG_BATCH:
+                        _, _, emg_samples = decode_emg(v)
+                        for s in emg_samples:
+                            raw = int(s[1])
+                            EMG_RING.append(raw)  # RAW channel
+                            ENV_RING.append(env_filter.update(abs(raw)))
+                    elif t == TLV_IMU_BATCH:
+                        _, _, imu_samples = decode_imu(v)
+                        for s in imu_samples:
+                            mag = np.sqrt(s[0]**2 + s[1]**2 + s[2]**2)
+                            IMU_RING.append(mag)
+                if emg_samples is not None or imu_samples is not None:
+                    ts_ms = int(time.time()*1000)
+                    for i in range(max(len(emg_samples) if emg_samples is not None else 0,
+                                       len(imu_samples) if imu_samples is not None else 0)):
+                        env = emg_samples[i][0] if emg_samples is not None and i < len(emg_samples) else ""
+                        raw = emg_samples[i][1] if emg_samples is not None and i < len(emg_samples) else ""
+                        ref = emg_samples[i][2] if emg_samples is not None and i < len(emg_samples) else ""
+                        ax = imu_samples[i][0] if imu_samples is not None and i < len(imu_samples) else ""
+                        ay = imu_samples[i][1] if imu_samples is not None and i < len(imu_samples) else ""
+                        az = imu_samples[i][2] if imu_samples is not None and i < len(imu_samples) else ""
+                        gx = imu_samples[i][3] if imu_samples is not None and i < len(imu_samples) else ""
+                        gy = imu_samples[i][4] if imu_samples is not None and i < len(imu_samples) else ""
+                        gz = imu_samples[i][5] if imu_samples is not None and i < len(imu_samples) else ""
+                        writer.writerow([ts_ms, env, raw, ref, ax, ay, az, gx, gy, gz])
+                    csv_file.flush()
+        await client.start_notify(NUS_TX_UUID, handle)
+        print("Streaming... Press Ctrl+C to stop.")
+        try:
+            while True:
+                await asyncio.sleep(0.1)
+                plt.pause(0.001)  # allow GUI to process events
+        except KeyboardInterrupt:
+            pass
 
-            def handle(_: BleakGATTCharacteristic, data: bytearray):
-                nonlocal fs_est, window_samples, last_feature
-                now = time.time()
-                for line in parser.feed(bytes(data)):
-                    parts = line.split(',')
-                    if len(parts) < 2:
-                        continue
-                    try:
-                        env_sh = float(parts[0])  # ENV first
-                        raw = float(parts[1])     # RAW second
-                    except Exception:
-                        continue
+        except KeyboardInterrupt:
+            pass
+        await client.stop_notify(NUS_TX_UUID)
+        csv_file.close()
 
-                    ts_hist.append(now)
-                    if fs_user <= 0 and len(ts_hist) >= 5:
-                        dts = [t2 - t1 for t1, t2 in zip(ts_hist, list(ts_hist)[1:])]
-                        avg_dt = float(np.mean(dts)) if dts else 0.01
-                        new_fs = float(1.0 / max(1e-6, avg_dt))
-                        if abs(new_fs - fs_est) / fs_est > 0.05:
-                            fs_est = new_fs
-                            env_butter.set_fs(fs_est)
-                            env_rms.set_fs(fs_est)
-                            window_samples = int(max(16, fs_est * window_sec))
-
-                    rect = abs(raw)
-                    env_bt = env_butter.update(rect)
-                    env_rm = env_rms.update(rect)
-
-                    mdf, mnf = (np.nan, np.nan)
-                    if time.time() - last_feature > 0.2:
-                        seg = raw_ring.view_latest(window_samples)
-                        if len(seg) >= window_samples:
-                            seg_bp = bandpass_filter(seg - np.mean(seg), fs_est)
-                            mdf, mnf = median_mean_frequency(seg_bp, fs=fs_est)
-                        last_feature = time.time()
-
-                    raw_ring.append_many([raw])
-                    env_shield_ring.append_many([env_sh])
-                    env_pc_ring.append_many([env_bt])
-                    env_rms_ring.append_many([env_rm])
-
-                    if args.out != 'none':
-                        ts_ms = int(now * 1000)
-                        if args.out == 'csv':
-                            cols = [str(ts_ms), f"{env_sh}", f"{raw}", f"{env_bt}", f"{env_rm}", f"{mdf}", f"{mnf}"]
-                            print(','.join(cols))
-                        elif args.out == 'plain':
-                            print(f"[{ts_ms}] env_shield={env_sh} raw={raw} env_bt={env_bt} env_rms={env_rm} MDF={mdf} MNF={mnf}")
-                        sys.stdout.flush()
-
-                    if csv_writer:
-                        csv_writer.writerow([int(now*1000), env_sh, raw, env_bt, env_rm, mdf, mnf])
-                        if (int(now*10) % 10) == 0:
-                            csv_file.flush()
-
-            await client.start_notify(ch_obj, handle)
-            print("Subscribed to NUS TX; streaming...")
-
-            if args.no_plot:
-                try:
-                    while not disconnected.is_set():
-                        await asyncio.sleep(0.5)
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    await client.stop_notify(ch_obj)
-                    if csv_file:
-                        csv_file.flush(); csv_file.close()
-                return True
-
-            # Plotting
-            plt.style.use('seaborn-v0_8')
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
-            raw_line, = ax1.plot([], [], color='steelblue', lw=0.9, label='RAW')
-            env_bt_line, = ax1.plot([], [], color='crimson', lw=1.6, label='Envelope (PC Butter)')
-            env_rms_line, = ax1.plot([], [], color='teal', lw=1.6, label='Envelope (PC RMS)')
-            env_sh_line, = ax1.plot([], [], color='gray', lw=1.2, ls='--', label='Envelope (Shield)')
-            ax1.set_title('EMG RAW & Envelopes')
-            ax1.set_ylabel('Amplitude')
-            ax1.legend()
-
-            mdf_line, = ax2.plot([], [], color='green', lw=1.2, label='MDF')
-            mnf_line, = ax2.plot([], [], color='orange', lw=1.2, label='MNF')
-            ax2.set_title('Spectral Features')
-            ax2.set_ylabel('Frequency (Hz)')
-            ax2.set_xlabel('Time')
-            ax2.legend()
-
-            mdf_trend = deque(maxlen=600)
-            mnf_trend = deque(maxlen=600)
-
-            def update(_frame):
-                fs = fs_user if fs_user > 0 else fs_est
-                disp_sec = 5.0
-                n_disp = int(max(10, fs * disp_sec))
-                raw_data = raw_ring.view_latest(n_disp)
-                env_pc_data = env_pc_ring.view_latest(n_disp)
-                env_rms_data = env_rms_ring.view_latest(n_disp)
-                env_sh_data = env_shield_ring.view_latest(n_disp)
-                t = np.arange(len(raw_data)) / max(1e-3, fs)
-                if len(raw_data) > 0:
-                    raw_line.set_data(t, raw_data)
-                    env_bt_line.set_data(t, env_pc_data)
-                    env_rms_line.set_data(t, env_rms_data)
-                    env_sh_line.set_data(t, env_sh_data)
-                    ax1.set_xlim(max(0, t[-1]-disp_sec), t[-1])
-                    ax1.set_ylim(0, max(1.0, float(np.max(raw_data))*1.1))
-                if len(mdf_trend) > 0:
-                    mdf_line.set_data(np.arange(len(mdf_trend)), np.asarray(mdf_trend))
-                if len(mnf_trend) > 0:
-                    mnf_line.set_data(np.arange(len(mnf_trend)), np.asarray(mnf_trend))
-                return raw_line, env_bt_line, env_rms_line, env_sh_line, mdf_line, mnf_line
-
-            ani = FuncAnimation(fig, update, interval=100)
-            plt.tight_layout()
-            plt.show()
-
-            await client.stop_notify(ch_obj)
-            if csv_file:
-                csv_file.flush(); csv_file.close()
-            return True
-    except Exception as e:
-        print(f"Session error: {e}")
-        await asyncio.sleep(backoff_s)
-        return False
-
-async def run(args):
-    base = 1.0
-    max_backoff = 30.0
-    backoff = base
-    try:
-        while True:
-            ok = await run_once(args, backoff)
-            if ok:
-                backoff = base
-            else:
-                backoff = min(max_backoff, backoff * 2.0)
-    except KeyboardInterrupt:
-        print("Interrupted.")
-
-def main():
-    parser = argparse.ArgumentParser(description="MyoWare BLE Central with fatigue analysis and bandpass filtering")
-    parser.add_argument('--name', type=str, required=True, help='BLE device name')
-    parser.add_argument('--char', type=str, default='', help='Characteristic UUID to subscribe to (default: NUS TX)')
-    parser.add_argument('--fs', type=float, default=0.0, help='Sampling rate (Hz), 0=estimate')
-    parser.add_argument('--cutoff', type=float, default=3.6, help='Butterworth cutoff (Hz)')
-    parser.add_argument('--win', type=float, default=50.0, help='RMS window (ms)')
-    parser.add_argument('--out', type=str, choices=['none','plain','csv'], default='none', help='Console output format')
-    parser.add_argument('--timestamp', action='store_true', help='Include timestamp')
-    parser.add_argument('--no-plot', action='store_true', help='Disable plotting')
-    parser.add_argument('--save', type=str, default='', help='CSV file path')
-    args = parser.parse_args()
-
-    asyncio.run(run(args))
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())

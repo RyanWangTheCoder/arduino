@@ -204,6 +204,7 @@ static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc = 0xFF
   return crc;
 }
 
+
 bool send_emg_frame(uint16_t maxPayload) {
   const uint16_t headerBytes = 14; // FrameHeader
   const uint16_t tlvHdrBytes = 3;
@@ -232,9 +233,9 @@ bool send_emg_frame(uint16_t maxPayload) {
   wr_u32(p += 4, frameSeq++);
   wr_u32(p, micros());
   wr_u16(p, 0); // payload_len placeholder
-  p += 2;
+  // ❌ DO NOT DO: p += 2;
 
-  // TLV header
+  // TLV header (starts exactly at offset 14)
   *p++ = TLV_EMG_BATCH;
   wr_u16(p, 0); // TLV len placeholder
   uint8_t* tlvLenPos = p - 2;
@@ -304,8 +305,8 @@ bool send_imu_frame(uint16_t maxPayload) {
   p[0] = MAGIC0; p[1] = MAGIC1; p[2] = PROTO_VER; p[3] = FLAG_CRC16;
   wr_u32(p += 4, frameSeq++);
   wr_u32(p, micros());
-  wr_u16(p, 0);
-  p += 2;
+  wr_u16(p, 0); // payload_len placeholder
+  // ❌ DO NOT DO: p += 2;
 
   *p++ = TLV_IMU_BATCH;
   wr_u16(p, 0);
