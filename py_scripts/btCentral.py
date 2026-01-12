@@ -1,11 +1,12 @@
 
 #!/usr/bin/env python3
 """
-MyoWare BLE Binary Stream Client (EMG + IMU)
---------------------------------------------
+MyoWare BLE Binary Stream Client (EMG + IMU + Vitals)
+------------------------------------------------------
 - Connects to Nordic UART Service (NUS)
 - Parses binary frames with TLV records
 - Logs EMG + IMU to rotating CSV files
+- Logs SpO₂ + HR to separate CSV file
 - Real-time plots: EMG raw + envelope, IMU magnitude
 """
 
@@ -29,9 +30,10 @@ HEADER_LEN = 14
 CRC_LEN = 2
 TLV_EMG_BATCH = 0x01
 TLV_IMU_BATCH = 0x02
+TLV_VITALS    = 0x03
 
-# CSV rotation settings
-MAX_ROWS = 200000
+# CSV rotation settings for EMG/IMU
+MAX_ROWS = 2000000
 file_idx = 0
 row_count = 0
 
@@ -41,11 +43,17 @@ def open_csv():
     f = open(fname, "w", newline="", encoding="utf-8")
     w = csv.writer(f)
     w.writerow(["ts_ms","env","raw","ref","ax","ay","az","gx","gy","gz"])
-    print(f"[CSV] Logging to {fname}")
+    print(f"[CSV] Logging EMG/IMU to {fname}")
     row_count = 0
     return f, w
 
 csv_file, writer = open_csv()
+
+# Vitals CSV
+vitals_file = open("vitals_log.csv", "w", newline="", encoding="utf-8")
+vitals_writer = csv.writer(vitals_file)
+vitals_writer.writerow(["ts_ms","spo2","hr_bpm","age_ms","flags","brightness"])
+print("[CSV] Logging Vitals to vitals_log.csv")
 
 # Plot buffers
 EMG_RING = deque(maxlen=5000)
@@ -131,8 +139,21 @@ def decode_imu(val):
     samples = np.frombuffer(val[12:], dtype="<i2").reshape(count, 6)
     return imu_seq0, sr_hz, samples
 
+def decode_vitals(val):
+    # Layout: spo2(u16), hr_x10(u16), age_ms(u16), flags(u8), brightness(u8)
+    spo2, hr_x10, age_ms, flags, bright = struct.unpack_from("<HHHBB", val, 0)
+    spo2_val = spo2 if spo2 != 0xFFFF else None
+    hr_val = (hr_x10 / 10.0) if hr_x10 != 0xFFFF else None
+    return {
+        "spo2": spo2_val,
+        "hr": hr_val,
+        "age_ms": age_ms,
+        "flags": flags,
+        "brightness": bright
+    }
+
 async def main():
-    KNOWN = {TLV_EMG_BATCH, TLV_IMU_BATCH}
+    KNOWN = {TLV_EMG_BATCH, TLV_IMU_BATCH, TLV_VITALS}
     device = await BleakScanner.find_device_by_filter(lambda d, adv: NUS_SERVICE_UUID.lower() in (adv.service_uuids or []))
     if not device:
         print("Device not found.")
@@ -192,6 +213,21 @@ async def main():
                         for s in imu_samples:
                             mag = np.sqrt(s[0]**2 + s[1]**2 + s[2]**2)
                             IMU_RING.append(mag)
+                    elif t == TLV_VITALS:
+                        vitals = decode_vitals(v)
+                        ts_ms = int(time.time()*1000)
+                        print(f"[Vitals] SpO₂={vitals['spo2'] if vitals['spo2'] else 'NA'}% "
+                              f"HR={vitals['hr'] if vitals['hr'] else 'NA'} bpm "
+                              f"(age={vitals['age_ms']}ms, bright=0x{vitals['brightness']:02X})")
+                        vitals_writer.writerow([
+                            ts_ms,
+                            vitals['spo2'] if vitals['spo2'] else "",
+                            vitals['hr'] if vitals['hr'] else "",
+                            vitals['age_ms'],
+                            vitals['flags'],
+                            vitals['brightness']
+                        ])
+                        vitals_file.flush()
                 if emg_samples is not None or imu_samples is not None:
                     ts_ms = int(time.time()*1000)
                     max_len = max(len(emg_samples) if emg_samples is not None else 0,
@@ -224,6 +260,7 @@ async def main():
             pass
         await client.stop_notify(NUS_TX_UUID)
         csv_file.close()
+        vitals_file.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

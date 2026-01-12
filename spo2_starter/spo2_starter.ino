@@ -1,7 +1,7 @@
 
 #include <Wire.h>
 #include "MAX30105.h"
-#include "spo2_algorithm.h"  // SparkFun library includes this
+#include "spo2_algorithm.h"
 
 MAX30105 sensor;
 
@@ -19,6 +19,15 @@ uint32_t redBuffer[SPO2_BUFFER_SIZE];
 // HR smoothing
 float hrAvg = 0;
 
+// LED brightness range
+byte ledBrightness = 0x1F; // Start low
+const byte BRIGHTNESS_MIN = 0x0F;
+const byte BRIGHTNESS_MAX = 0x7F;
+
+// Saturation thresholds
+const uint32_t SATURATION_HIGH = 200000; // ADC near max
+const uint32_t SATURATION_LOW  = 10000;  // Very weak signal
+
 void setup() {
   Serial.begin(115200);
   delay(1500);
@@ -33,16 +42,7 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // Configure sensor for SpO₂
-  byte ledBrightness = 0x1F; // Lower brightness to avoid saturation
-  byte sampleAverage = 4;
-  byte ledMode       = 2;    // Red + IR
-  int sampleRate     = 25;   // Lower rate for SpO₂
-  int pulseWidth     = 411;  // Wide pulse for better SNR
-  int adcRange       = 4096;
-
-  sensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
-
+  configureSensor();
   Serial.println("Place finger firmly, block ambient light, hold still...");
 }
 
@@ -57,6 +57,22 @@ void loop() {
     redBuffer[i] = sensor.getRed();
     irBuffer[i]  = sensor.getIR();
     sensor.nextSample();
+  }
+
+  // Auto brightness adjustment based on last IR value
+  uint32_t lastIR = irBuffer[SPO2_BUFFER_SIZE - 1];
+  if (lastIR > SATURATION_HIGH && ledBrightness > BRIGHTNESS_MIN) {
+    ledBrightness -= 0x0F; // decrease brightness
+    if (ledBrightness < BRIGHTNESS_MIN) ledBrightness = BRIGHTNESS_MIN;
+    Serial.print("Reducing brightness to: ");
+    Serial.println(ledBrightness);
+    configureSensor();
+  } else if (lastIR < SATURATION_LOW && ledBrightness < BRIGHTNESS_MAX) {
+    ledBrightness += 0x0F; // increase brightness
+    if (ledBrightness > BRIGHTNESS_MAX) ledBrightness = BRIGHTNESS_MAX;
+    Serial.print("Increasing brightness to: ");
+    Serial.println(ledBrightness);
+    configureSensor();
   }
 
   // Compute SpO₂ and HR
@@ -88,10 +104,20 @@ void loop() {
 
   // Debug: last raw values
   Serial.print("IR=");
-  Serial.print(irBuffer[SPO2_BUFFER_SIZE - 1]);
+  Serial.print(lastIR);
   Serial.print("  RED=");
   Serial.println(redBuffer[SPO2_BUFFER_SIZE - 1]);
 
   // Wait 30 seconds before next measurement
-  delay(10000);
+  delay(30000);
+}
+
+void configureSensor() {
+  byte sampleAverage = 4;
+  byte ledMode       = 2;    // Red + IR
+  int sampleRate     = 25;   // Lower rate for SpO₂
+  int pulseWidth     = 411;  // Wide pulse for better SNR
+  int adcRange       = 4096;
+
+  sensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
 }
