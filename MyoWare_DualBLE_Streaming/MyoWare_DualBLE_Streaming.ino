@@ -105,7 +105,7 @@ void loop() {
     // Send data over BLE
     if (isConnected && pTXCharacteristic) {
       char buffer[32];
-      snprintf(buffer, sizeof(buffer), "%d,%d\r\n", env, raw);
+      snprintf(buffer, sizeof(buffer), "%d,%d,%d\r\n", env, raw, ref);
       pTXCharacteristic->setValue(buffer);
       pTXCharacteristic->notify();
       delay(5); // Helps BLE stack breathe
