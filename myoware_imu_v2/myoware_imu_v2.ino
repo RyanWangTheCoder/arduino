@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 
@@ -42,12 +41,45 @@ static constexpr uint32_t HEALTH_REPORT_MS = 1000;
 // ==================== Protocol ====================
 static constexpr uint8_t MAGIC0 = 0xA5;
 static constexpr uint8_t MAGIC1 = 0x5A;
-static constexpr uint8_t PROTO_VER = 0x01;
-static constexpr uint8_t FLAG_CRC16 = 0x01;
+
+// PROTO_VER bumped to v2 to indicate IMU meta includes FSR fields
+static constexpr uint8_t PROTO_VER = 0x02;
+
+static constexpr uint8_t FLAG_CRC16       = 0x01;
+static constexpr uint8_t FLAG_IMU_META_V2 = 0x02; // IMU meta includes FSR bytes
 
 static constexpr uint8_t TLV_EMG_BATCH = 0x01;
 static constexpr uint8_t TLV_IMU_BATCH = 0x02;
-static constexpr uint8_t TLV_VITALS    = 0x03;   // <-- NEW
+static constexpr uint8_t TLV_VITALS    = 0x03;
+
+// ==================== IMU scaling config (LOGGED IN META) ====================
+// These should match the actual ICM-20948 full scale configuration.
+// If you do not explicitly set full scale, the device/library defaults are typically:
+//   Accel: +/-2g (LSB/g=16384)
+//   Gyro : +/-250 dps (LSB/dps=131)
+// We log these so the host can automatically scale raw counts to physical units.
+static constexpr uint8_t  IMU_ACC_FSR_G     = 2;    // one of {2,4,8,16}
+static constexpr uint16_t IMU_GYRO_FSR_DPS  = 250;  // one of {250,500,1000,2000}
+
+// Encode FSRs into compact codes (1 byte each)
+static inline uint8_t accFsrToCode(uint8_t g) {
+  switch (g) {
+    case 2:  return 0;
+    case 4:  return 1;
+    case 8:  return 2;
+    case 16: return 3;
+    default: return 0;
+  }
+}
+static inline uint8_t gyroFsrToCode(uint16_t dps) {
+  switch (dps) {
+    case 250:  return 0;
+    case 500:  return 1;
+    case 1000: return 2;
+    case 2000: return 3;
+    default:   return 0;
+  }
+}
 
 struct EmgSample { uint16_t env, raw, ref; uint32_t t_us, seq; };
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };
@@ -409,7 +441,10 @@ bool send_emg_frame(uint16_t maxPayload) {
 bool send_imu_frame(uint16_t maxPayload) {
   const uint16_t headerBytes = 14;
   const uint16_t tlvHdrBytes = 3;
-  const uint16_t imuMetaBytes = 12;
+
+  // IMU meta v2 includes acc/gyro FSR codes (2 bytes) appended after channel mask
+  const uint16_t imuMetaBytes = 14; // was 12
+
   const uint16_t crcBytes = 2;
   const uint16_t bytesPerSample = 12;
 
@@ -431,7 +466,8 @@ bool send_imu_frame(uint16_t maxPayload) {
   uint8_t buf[512];
   uint8_t* p = buf;
 
-  p[0] = MAGIC0; p[1] = MAGIC1; p[2] = PROTO_VER; p[3] = FLAG_CRC16;
+  // Header: include FLAG_IMU_META_V2
+  p[0] = MAGIC0; p[1] = MAGIC1; p[2] = PROTO_VER; p[3] = (uint8_t)(FLAG_CRC16 | FLAG_IMU_META_V2);
   wr_u32(p += 4, frameSeq++);
   wr_u32(p, micros());
   wr_u16(p, 0);
@@ -447,9 +483,13 @@ bool send_imu_frame(uint16_t maxPayload) {
   if (off > 32767) off = 32767; if (off < -32768) off = -32768;
   wr_i16(p, (int16_t)off);
   wr_u16(p, IMU_RATE_HZ);
-  *p++ = N;
+  *p++ = (uint8_t)N;
   *p++ = 0;
   wr_u16(p, 0x003F);
+
+  // NEW: log IMU full-scale ranges as compact codes
+  *p++ = accFsrToCode(IMU_ACC_FSR_G);
+  *p++ = gyroFsrToCode(IMU_GYRO_FSR_DPS);
 
   for (uint16_t i = 0; i < N; i++) {
     wr_i16(p, batch[i].ax);
@@ -554,7 +594,7 @@ void setup() {
 
   // I2C init: ESP32 default pins are SDA=21, SCL=22
   Wire.begin();
-  Wire.setClock(400000); // IMU likes fast; MAX3010x typically tolerates 400k
+  Wire.setClock(400000);
 
   // ---- IMU init ----
   bool initialized = false;
@@ -562,6 +602,25 @@ void setup() {
     myICM.begin(Wire, AD0_VAL);
     if (myICM.status == ICM_20948_Stat_Ok) initialized = true;
     else { Serial.println("IMU init retry..."); delay(500); }
+  }
+
+  // Optional: explicitly set full-scale ranges to match the logged FSR values.
+  // If you prefer to rely on defaults, you can comment this block out.
+  {
+    ICM_20948_fss_t fss;
+    // Accel
+    fss.a = (IMU_ACC_FSR_G == 2)  ? gpm2  :
+            (IMU_ACC_FSR_G == 4)  ? gpm4  :
+            (IMU_ACC_FSR_G == 8)  ? gpm8  :
+                                   gpm16;
+    // Gyro
+    fss.g = (IMU_GYRO_FSR_DPS == 250)  ? dps250  :
+            (IMU_GYRO_FSR_DPS == 500)  ? dps500  :
+            (IMU_GYRO_FSR_DPS == 1000) ? dps1000 :
+                                         dps2000;
+
+    myICM.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
+    Serial.printf("[IMU] Set FSR: acc=+/- %ug, gyro=+/- %udps\n", IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
   }
 
   // ---- MAX3010x init (non-fatal if missing) ----
