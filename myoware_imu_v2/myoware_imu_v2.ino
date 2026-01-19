@@ -61,6 +61,19 @@ static constexpr uint8_t TLV_VITALS    = 0x03;
 static constexpr uint8_t  IMU_ACC_FSR_G     = 2;    // one of {2,4,8,16}
 static constexpr uint16_t IMU_GYRO_FSR_DPS  = 250;  // one of {250,500,1000,2000}
 
+struct EmgSample { uint16_t env, raw, ref; uint32_t t_us, seq; };
+struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };
+
+static EmgSample emgBuf[EMG_BUF_SIZE];
+static ImuSample imuBuf[IMU_BUF_SIZE];
+static volatile uint16_t emgHead = 0, emgTail = 0;
+static volatile uint16_t imuHead = 0, imuTail = 0;
+static volatile uint32_t emgSeq = 0, imuSeq = 0;
+static volatile uint32_t emgDropped = 0, imuDropped = 0;
+
+static portMUX_TYPE emgMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE imuMux = portMUX_INITIALIZER_UNLOCKED;
+
 // Encode FSRs into compact codes (1 byte each)
 static inline uint8_t accFsrToCode(uint8_t g) {
   switch (g) {
@@ -80,19 +93,6 @@ static inline uint8_t gyroFsrToCode(uint16_t dps) {
     default:   return 0;
   }
 }
-
-struct EmgSample { uint16_t env, raw, ref; uint32_t t_us, seq; };
-struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };
-
-static EmgSample emgBuf[EMG_BUF_SIZE];
-static ImuSample imuBuf[IMU_BUF_SIZE];
-static volatile uint16_t emgHead = 0, emgTail = 0;
-static volatile uint16_t imuHead = 0, imuTail = 0;
-static volatile uint32_t emgSeq = 0, imuSeq = 0;
-static volatile uint32_t emgDropped = 0, imuDropped = 0;
-
-static portMUX_TYPE emgMux = portMUX_INITIALIZER_UNLOCKED;
-static portMUX_TYPE imuMux = portMUX_INITIALIZER_UNLOCKED;
 
 static inline uint16_t rb_next(uint16_t idx, uint16_t size) { return (idx + 1) % size; }
 

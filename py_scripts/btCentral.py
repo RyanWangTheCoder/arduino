@@ -53,6 +53,24 @@ MAX_ROWS = 2000000
 file_idx = 0
 row_count = 0
 
+# Sidecar metadata for each rotated CSV
+current_meta = {
+    "proto_ver": None,
+    "imu_acc_fsr_g": None,
+    "imu_gyro_fsr_dps": None,
+    "imu_rate_hz": None,
+}
+
+def meta_path_for_idx(idx: int) -> str:
+    return f"emg_imu_log_{idx:03d}.meta.json"
+
+
+def write_meta(idx: int):
+    path = meta_path_for_idx(idx)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(current_meta, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
 
 def open_csv():
     global file_idx, row_count
@@ -68,25 +86,8 @@ def open_csv():
 
 csv_file, writer = open_csv()
 
-# Sidecar metadata for each rotated CSV
-current_meta = {
-    "proto_ver": None,
-    "imu_acc_fsr_g": None,
-    "imu_gyro_fsr_dps": None,
-    "imu_rate_hz": None,
-}
 
 
-def meta_path_for_idx(idx: int) -> str:
-    return f"emg_imu_log_{idx:03d}.meta.json"
-
-
-def write_meta(idx: int):
-    path = meta_path_for_idx(idx)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(current_meta, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)
 
 
 # Vitals CSV
