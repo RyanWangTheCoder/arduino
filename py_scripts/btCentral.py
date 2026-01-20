@@ -1,35 +1,21 @@
-
 #!/usr/bin/env python3
 """
-btCentral.py — MyoWare EMG + ICM-20948 IMU + Vitals BLE recorder (Windows/Bleak)
+btCentral_watchdog.py — MyoWare EMG + ICM-20948 IMU + Vitals BLE recorder (Windows/Bleak)
 
-Features:
-- Connects to Nordic UART Service (NUS) TX notifications
-- Parses binary frames (MAGIC + header + TLVs + optional CRC16)
-- Logs to separate CSVs for EMG and IMU
-- Time-based rotation (default 30 minutes, configurable via --rotate-min)
-- Timestamped filenames include BOTH:
-    * SESSIONID (run start time)
-    * OPENID (file open time for each rotated segment)
-- Logs use device-derived timestamps (dev_us, 64-bit monotonic extension of micros())
-- Records IMU FSR values (acc_fsr_g, gyro_fsr_dps) in IMU CSV and meta JSON
-- Vitals log is single file (low rate, no rotation by default)
-- Queue-based notify callback + consumer parser for stability on Windows
-- Parser sanity checks to avoid stalls on corrupted headers
-- Thread-safe enqueue from WinRT callback using loop.call_soon_threadsafe
+This is a hardened version of your original btCentral.py with:
+- Windows-side application watchdog (no retransmission):
+  * Tracks last notification time + last good frame time
+  * Sends periodic PING writes to NUS RX characteristic
+  * Detects stalls (no notifications) and auto-reconnects with backoff
+- Stronger health reporting: notify rate, ages, ping status, reconnect reason
+- Thread-safe stats: notify callback only schedules work onto asyncio loop
+- Frame parser robustness fix: append parsed frame once (not per TLV)
 
-Usage examples:
-  # Connect by advertised name (recommended; no MAC needed)
-  python btCentral.py --name MyoW1 --outdir logs --rotate-min 20
-
-  # Or connect by address (optional)
-  python btCentral.py --device 88:13:BF:28:9A:EE --outdir logs --rotate-min 20
-
-  # If scan is flaky, increase scan time
-  python btCentral.py --name MyoW1 --scan-timeout 20 --outdir logs
+Usage:
+  python btCentral_watchdog.py --name MyoW1 --outdir logs --rotate-min 20
 
 Notes:
-- For max stability, keep it headless (no plotting in this script).
+- Keep it headless for stability (no plotting here). Use separate tools for realtime viz.
 """
 
 import argparse
@@ -38,6 +24,7 @@ import csv
 import json
 import os
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +33,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 # ---- Windows COM / WinRT quirks (Bleak) ----
-import sys
 if sys.platform == "win32":
     # Prefer MTA for BLE; must be set before importing WinRT/COM related modules.
     sys.coinit_flags = 0
@@ -61,7 +47,8 @@ from bleak import BleakClient, BleakScanner
 
 # ---- UUIDs (Nordic UART Service) ----
 NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-NUS_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # notifications from device
+NUS_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # writes to device
 
 # ---- Binary protocol constants ----
 MAGIC = b"\xA5\x5A"
@@ -70,12 +57,12 @@ CRC_LEN = 2
 
 TLV_EMG_BATCH = 0x01
 TLV_IMU_BATCH = 0x02
-TLV_VITALS    = 0x03
+TLV_VITALS = 0x03
 
-FLAG_CRC16       = 0x01
+FLAG_CRC16 = 0x01
 FLAG_IMU_META_V2 = 0x02
 
-ACC_FSR_CODE_TO_G    = {0: 2, 1: 4, 2: 8, 3: 16}
+ACC_FSR_CODE_TO_G = {0: 2, 1: 4, 2: 8, 3: 16}
 GYRO_FSR_CODE_TO_DPS = {0: 250, 1: 500, 2: 1000, 3: 2000}
 
 # Sanity cap to prevent parser stall on corrupted headers.
@@ -85,6 +72,14 @@ MAX_PAYLOAD_LEN = 512
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def fmt_mmss(seconds: float) -> str:
+    """Format seconds as mm:ss (clamped >=0)."""
+    seconds = max(0.0, float(seconds))
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m:02d}:{s:02d}"
 
 
 def crc16_ccitt(data: bytes, crc: int = 0xFFFF) -> int:
@@ -105,6 +100,7 @@ def imu_scale_factors(acc_fsr_g: int, gyro_fsr_dps: int) -> Tuple[float, float]:
 
 class FrameParser:
     """Incremental parser for MAGIC-framed packets with sanity checks."""
+
     def __init__(self) -> None:
         self.buf = bytearray()
 
@@ -115,7 +111,7 @@ class FrameParser:
         while True:
             i = self.buf.find(MAGIC)
             if i < 0:
-                # keep last byte as possible partial MAGIC
+                # Keep last byte as possible partial MAGIC
                 if len(self.buf) > 1:
                     del self.buf[:-1]
                 break
@@ -161,6 +157,7 @@ class FrameParser:
                 tlvs.append((tlv_type, payload[off:off + tlv_len]))
                 off += tlv_len
 
+            # Append ONE frame (not once per TLV)
             frames.append((ver, flags, frame_seq, t_us_u32, tlvs))
 
         return frames
@@ -169,7 +166,8 @@ class FrameParser:
 # ---- TLV decoders ----
 
 def decode_emg(val: bytes):
-    # meta: seq0(u32), t0_off(i16), sr_hz(u16), channels(u8), rsv(u16), count(u16)
+    # meta: seq0(u32), t0_off(i16), sr_hz(u16), channels(u8), mask(u8), rsv(u8), count(u16)
+    # Firmware meta bytes: 13
     seq0, t0_off, sr_hz = struct.unpack_from("<IhH", val, 0)
     channels = val[8]
     count = struct.unpack_from("<H", val, 11)[0]
@@ -182,11 +180,9 @@ def decode_imu(val: bytes, ver: int, flags: int):
     # meta v2 (14): v1 + acc_fsr_code(u8) + gyro_fsr_code(u8)
     seq0, t0_off, sr_hz = struct.unpack_from("<IhH", val, 0)
     count = val[8]
-
     meta_len = 12
     acc_fsr_g = None
     gyro_fsr_dps = None
-
     if (ver >= 2) or (flags & FLAG_IMU_META_V2):
         meta_len = 14
         if len(val) >= 14:
@@ -209,6 +205,7 @@ def decode_vitals(val: bytes) -> Dict[str, Optional[float]]:
 
 class DeviceClockExtender:
     """Extend 32-bit micros() timestamps to a monotonic 64-bit timeline."""
+
     def __init__(self) -> None:
         self.wraps = 0
         self.last_u32: Optional[int] = None
@@ -235,7 +232,6 @@ class TimeRotatingCsv:
     header: List[str]
     rotate_sec: float
     meta: Dict
-
     idx: int = 0
     t_open: float = 0.0
     open_id: str = ""  # per-file open timestamp
@@ -259,16 +255,13 @@ class TimeRotatingCsv:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.t_open = time.time()
         self.open_id = time.strftime("%Y%m%d_%H%M%S")
-
         self.fp = open(self._csv_path(), "w", newline="", encoding="utf-8")
         self.w = csv.writer(self.fp)
         self.w.writerow(self.header)
-
         self.meta["file_index"] = int(self.idx)
         self.meta["opened_host_ms"] = int(time.time() * 1000)
         self.meta["opened_id"] = self.open_id
         self._write_meta()
-
         print(f"[CSV] Logging to {self._csv_path()}")
 
     def rotate_if_needed(self) -> None:
@@ -316,17 +309,26 @@ def is_imu_saturated(sample6: np.ndarray) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="btCentral: robust BLE recorder")
+    ap = argparse.ArgumentParser(description="btCentral: robust BLE recorder (with watchdog)")
     ap.add_argument("--outdir", default="logs", help="Output directory")
-    ap.add_argument("--device", default=None, help="BLE address. If omitted, you can use --name or scan by NUS service.")
+    ap.add_argument("--device", default=None,
+                    help="BLE address. If omitted, you can use --name or scan by NUS service.")
     ap.add_argument("--name", default=None, help="BLE advertised name to match (e.g., MyoW1).")
-    ap.add_argument("--scan-timeout", type=float, default=10.0, help="Scan timeout seconds when using --name or scanning.")
+    ap.add_argument("--scan-timeout", type=float, default=10.0, help="Scan timeout seconds")
     ap.add_argument("--rotate-min", type=float, default=30.0, help="Rotate EMG/IMU files every N minutes")
     ap.add_argument("--queue-max", type=int, default=20000, help="Max queued notification chunks")
     ap.add_argument("--flush-sec", type=float, default=2.0, help="Flush interval (seconds)")
     ap.add_argument("--timeout", type=float, default=60.0, help="Connect/service discovery timeout (seconds)")
     ap.add_argument("--address-type", choices=["public", "random"], default=None,
                     help="Windows only: address type hint")
+
+    # Watchdog / keepalive tuning
+    ap.add_argument("--ping-sec", type=float, default=1.0, help="Send PING to device every N seconds")
+    ap.add_argument("--stall-warn-ms", type=int, default=2000, help="Warn if no notify for this long")
+    ap.add_argument("--stall-reconnect-ms", type=int, default=5000,
+                    help="Reconnect if no notify for this long")
+    ap.add_argument("--max-backoff-sec", type=float, default=20.0, help="Max reconnect backoff")
+
     return ap.parse_args()
 
 
@@ -336,7 +338,7 @@ async def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     rotate_sec = float(args.rotate_min) * 60.0
-    session_id = time.strftime("%Y%m%d_%H%M%S")  # run start id (local time)
+    session_id = time.strftime("%Y%m%d_%H%M%S")
 
     # Vitals CSV (no rotation by default)
     vitals_path = outdir / "vitals_log.csv"
@@ -348,6 +350,7 @@ async def main() -> None:
     print(f"[CSV] Logging vitals to {vitals_path}")
 
     started_host_ms = now_ms()
+
     emg_meta = {
         "proto_ver": None,
         "device": None,
@@ -357,6 +360,7 @@ async def main() -> None:
         "rotation_minutes": float(args.rotate_min),
         "session_id": session_id,
     }
+
     imu_meta = {
         "proto_ver": None,
         "device": None,
@@ -376,6 +380,7 @@ async def main() -> None:
         rotate_sec=rotate_sec,
         meta=emg_meta,
     )
+
     imu_csv = TimeRotatingCsv(
         outdir=outdir,
         base="imu_log",
@@ -388,15 +393,10 @@ async def main() -> None:
 
     # Queue for raw BLE notification chunks
     q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=int(args.queue_max))
-    stats = Stats()
 
+    stats = Stats()
     parser = FrameParser()
     clock = DeviceClockExtender()
-
-    # Current IMU scaling + FSR (updated from IMU TLV meta v2)
-    cur_acc_fsr_g = 2
-    cur_gyro_fsr_dps = 250
-    acc_lsb_per_g, gyro_lsb_per_dps = imu_scale_factors(cur_acc_fsr_g, cur_gyro_fsr_dps)
 
     # Buffers for batch disk writes
     emg_rows: List[List] = []
@@ -404,6 +404,38 @@ async def main() -> None:
 
     # Throttle meta writes (write on open/rotate + every 10 seconds)
     last_meta_write = 0.0
+
+    # Liveliness / watchdog state
+    last_notify_ms = now_ms()
+    last_good_frame_ms = now_ms()
+    notify_calls = 0
+    subscribed = False
+
+    last_frame_seq: Optional[int] = None
+    frame_gaps = 0
+
+    last_ping_ok_ms = 0
+    ping_fail = 0
+
+    reconnects = 0
+    last_reconnect_reason = ""
+
+    loop = asyncio.get_running_loop()
+
+    # Thread-safe enqueue (runs on asyncio loop thread)
+    def enqueue_chunk(b: bytes):
+        nonlocal last_notify_ms, notify_calls
+        last_notify_ms = now_ms()
+        notify_calls += 1
+        stats.rx_bytes += len(b)
+        try:
+            q.put_nowait(b)
+        except asyncio.QueueFull:
+            stats.queue_drops += 1
+
+    def on_notify(_: int, data: bytearray):
+        # Do NOT touch shared stats here; schedule onto loop thread.
+        loop.call_soon_threadsafe(enqueue_chunk, bytes(data))
 
     async def writer_task() -> None:
         nonlocal emg_rows, imu_rows
@@ -418,6 +450,7 @@ async def main() -> None:
                 if imu_rows:
                     imu_csv.writerows(imu_rows)
                     imu_rows = []
+
                 emg_csv.flush()
                 imu_csv.flush()
                 vit_fp.flush()
@@ -426,27 +459,58 @@ async def main() -> None:
     async def health_task() -> None:
         last_frames = 0
         last_bytes = 0
+        last_calls = 0
+        last_gaps = 0
         while True:
             await asyncio.sleep(1.0)
             fps = stats.frames_ok - last_frames
             bps = stats.rx_bytes - last_bytes
+            nps = notify_calls - last_calls
+            gaps_s = frame_gaps - last_gaps
+
             last_frames = stats.frames_ok
             last_bytes = stats.rx_bytes
-            print(f"[Health] frames/s={fps} rx_kB/s={bps/1024.0:.1f} q={q.qsize()} "
-                  f"crc_err={stats.crc_errors} q_drop={stats.queue_drops} imu_sat={stats.imu_sat}")
+            last_calls = notify_calls
+            last_gaps = frame_gaps
+
+            age_notify = now_ms() - last_notify_ms
+            age_good = now_ms() - last_good_frame_ms
+            age_pingok = (now_ms() - last_ping_ok_ms) if last_ping_ok_ms else -1
+
+            state = "OK" if age_notify <= args.stall_warn_ms else ("WARN" if age_notify <= args.stall_reconnect_ms else "STALL")
+
+            # Segment info: index and offset since current rotated EMG file opened
+            if emg_csv.fp is None:
+                seg_idx = -1
+                seg_off = 'NA'
+            else:
+                seg_idx = int(emg_csv.idx)
+                seg_off = fmt_mmss(time.time() - float(emg_csv.t_open))
+
+            print(
+                f"[Health] seg={seg_idx} off={seg_off} state={state} conn_sub={int(subscribed)} fps={fps} notify/s={nps} rx_kB/s={bps/1024.0:.1f} q={q.qsize()} "
+                f"crc={stats.crc_errors} q_drop={stats.queue_drops} imu_sat={stats.imu_sat} "
+                f"last_notify={age_notify}ms last_good={age_good}ms ping_age={age_pingok}ms ping_fail={ping_fail} "
+                f"gaps/s={gaps_s} recon={reconnects} reason={last_reconnect_reason}"
+            )
+
 
     async def consumer_task() -> None:
-        nonlocal cur_acc_fsr_g, cur_gyro_fsr_dps, acc_lsb_per_g, gyro_lsb_per_dps
         nonlocal last_meta_write, emg_rows, imu_rows
+        nonlocal last_good_frame_ms, last_frame_seq, frame_gaps
+
+        # Current IMU scaling + FSR (updated from IMU TLV meta v2)
+        cur_acc_fsr_g = 2
+        cur_gyro_fsr_dps = 250
+        imu_scale_factors(cur_acc_fsr_g, cur_gyro_fsr_dps)  # keep function hot
 
         while True:
             # Drain a batch of chunks to reduce overhead
-            chunks = [await q.get()]
-            q.task_done()
+            first = await q.get()
+            chunks = [first]
             for _ in range(63):
                 try:
                     chunks.append(q.get_nowait())
-                    q.task_done()
                 except asyncio.QueueEmpty:
                     break
 
@@ -459,6 +523,15 @@ async def main() -> None:
                         continue
 
                     stats.frames_ok += 1
+                    last_good_frame_ms = now_ms()
+
+                    # frameSeq gap tracking
+                    if last_frame_seq is not None:
+                        expected = (last_frame_seq + 1) & 0xFFFFFFFF
+                        if int(frame_seq) != expected:
+                            frame_gaps += 1
+                    last_frame_seq = int(frame_seq)
+
                     dev_frame_us = clock.extend(t_us_u32)
 
                     # Store proto ver once
@@ -476,7 +549,6 @@ async def main() -> None:
                             emg_meta["emg_rate_hz"] = int(sr_hz)
                             emg_meta["channels"] = int(ch)
 
-                            # Per sample rows
                             for i in range(samples.shape[0]):
                                 dev_us = t0_us + i * step_us
                                 env = int(samples[i, 0])
@@ -495,7 +567,6 @@ async def main() -> None:
                                 cur_acc_fsr_g = int(acc_fsr_g)
                             if gyro_fsr_dps is not None:
                                 cur_gyro_fsr_dps = int(gyro_fsr_dps)
-                            acc_lsb_per_g, gyro_lsb_per_dps = imu_scale_factors(cur_acc_fsr_g, cur_gyro_fsr_dps)
 
                             imu_meta["imu_rate_hz"] = int(sr_hz)
                             imu_meta["imu_acc_fsr_g"] = int(cur_acc_fsr_g)
@@ -505,9 +576,11 @@ async def main() -> None:
                                 s = samples[i, :]
                                 dev_us = t0_us + i * step_us
                                 ax, ay, az, gx, gy, gz = [int(x) for x in s.tolist()]
-                                imu_rows.append([dev_us, seq0 + i, ax, ay, az, gx, gy, gz,
-                                                 int(cur_acc_fsr_g), int(cur_gyro_fsr_dps),
-                                                 int(frame_seq), host_rx])
+                                imu_rows.append([
+                                    dev_us, seq0 + i, ax, ay, az, gx, gy, gz,
+                                    int(cur_acc_fsr_g), int(cur_gyro_fsr_dps),
+                                    int(frame_seq), host_rx
+                                ])
                                 if is_imu_saturated(s):
                                     stats.imu_sat += 1
 
@@ -527,34 +600,38 @@ async def main() -> None:
                                 host_rx,
                             ])
 
-                    # Periodic meta write (keeps current rate/FSR updated)
+                    # Periodic meta write
                     now = time.time()
                     if (now - last_meta_write) > 10.0:
                         emg_csv.meta = emg_meta
                         imu_csv.meta = imu_meta
-                        # Write meta for current files
                         try:
                             emg_csv._write_meta()
                             imu_csv._write_meta()
                         except PermissionError:
-                            # Windows can transiently lock files due to AV/indexing; skip and retry later.
                             pass
                         last_meta_write = now
 
-    # ----- Device discovery -----
+            for _ in chunks:
+                q.task_done()
+
+    # Start background tasks (single instance for the run)
+    writer_t = asyncio.create_task(writer_task())
+    consumer_t = asyncio.create_task(consumer_task())
+    health_t = asyncio.create_task(health_task())
+
+    # ---- Device discovery ----
     device = None
     if args.device:
         device = await BleakScanner.find_device_by_address(args.device, timeout=float(args.scan_timeout))
         if device is None:
             print(f"[FATAL] Could not find device by address: {args.device}")
             return
+
     elif args.name:
         target = str(args.name).strip().lower()
         print(f"[BLE] Scanning for device name='{args.name}' (timeout={args.scan_timeout}s)...")
-
-        # Use return_adv=True so we can check adv.local_name as well as dev.name.
         found = await BleakScanner.discover(timeout=float(args.scan_timeout), return_adv=True)
-
         candidates = []
         for _addr, (dev, adv) in found.items():
             dev_name = (dev.name or "").strip().lower()
@@ -572,6 +649,7 @@ async def main() -> None:
         candidates.sort(reverse=True)
         device = candidates[0][2]
         print(f"[BLE] Selected {device.address} name={device.name}")
+
     else:
         print("[BLE] Scanning for NUS device...")
         device = await BleakScanner.find_device_by_filter(
@@ -581,57 +659,125 @@ async def main() -> None:
         if device is None:
             print("[FATAL] Device not found (NUS service UUID).")
             return
+        print(f"[BLE] Selected {device.address} name={device.name}")
 
-    print(f"[BLE] Connecting to {device.address}...")
     emg_meta["device"] = str(device.address)
     imu_meta["device"] = str(device.address)
 
-    # Start background tasks
-    writer_t = asyncio.create_task(writer_task())
-    consumer_t = asyncio.create_task(consumer_task())
-    health_t = asyncio.create_task(health_task())
+    # ---- Connection loop with watchdog-driven reconnect ----
+    backoff = 0.5
+    reconnect_evt = asyncio.Event()
 
-    # Thread-safe enqueue from BLE callback
-    loop = asyncio.get_running_loop()
+    async def ping_task(client: BleakClient) -> None:
+        nonlocal last_ping_ok_ms, ping_fail
+        while True:
+            await asyncio.sleep(float(args.ping_sec))
+            try:
+                await client.write_gatt_char(NUS_RX_UUID, b"PING", response=False)
+                last_ping_ok_ms = now_ms()
+            except Exception:
+                ping_fail += 1
 
-    def _enqueue_chunk(b: bytes):
-        try:
-            q.put_nowait(b)
-        except asyncio.QueueFull:
-            stats.queue_drops += 1
+    async def watchdog_task(client: BleakClient) -> None:
+        nonlocal last_reconnect_reason
+        while True:
+            await asyncio.sleep(0.5)
+            age = now_ms() - last_notify_ms
+            if age > int(args.stall_reconnect_ms):
+                # Try a lightweight resubscribe once.
+                last_reconnect_reason = f"stall_no_notify_{age}ms"
+                try:
+                    await client.stop_notify(NUS_TX_UUID)
+                    await asyncio.sleep(0.1)
+                    await client.start_notify(NUS_TX_UUID, on_notify)
+                    last_reconnect_reason = f"resubscribe_attempted_{age}ms"
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    pass
 
-    def on_notify(_: int, data: bytearray):
-        stats.rx_bytes += len(data)
-        loop.call_soon_threadsafe(_enqueue_chunk, bytes(data))
+                # If still stalled after resubscribe attempt, request reconnect
+                if (now_ms() - last_notify_ms) > int(args.stall_reconnect_ms):
+                    last_reconnect_reason = f"reconnect_after_resub_{now_ms() - last_notify_ms}ms"
+                    reconnect_evt.set()
+                    return
 
-    # Connect and subscribe
-    winrt_args = {}
-    if args.address_type:
-        winrt_args["address_type"] = args.address_type
+    print(f"[BLE] Connecting to {device.address}...")
 
     try:
-        async with BleakClient(
-            device,
-            timeout=float(args.timeout),
-            services=[NUS_SERVICE_UUID],
-            winrt=winrt_args,
-        ) as client:
-            try:
-                await client.request_mtu(247)
-            except Exception:
-                pass
+        while True:
+            winrt_args = {}
+            if args.address_type:
+                winrt_args["address_type"] = args.address_type
 
-            print("[BLE] Subscribing...")
-            await client.start_notify(NUS_TX_UUID, on_notify)
-            print("[BLE] Recording... Ctrl+C to stop")
+            reconnect_evt.clear()
 
             try:
-                while True:
-                    await asyncio.sleep(0.25)
+                async with BleakClient(
+                    device,
+                    timeout=float(args.timeout),
+                    services=[NUS_SERVICE_UUID],
+                    winrt=winrt_args,
+                ) as client:
+                    try:
+                        await client.request_mtu(247)
+                    except Exception:
+                        pass
+
+                    print("[BLE] Subscribing...")
+                    await client.start_notify(NUS_TX_UUID, on_notify)
+                    subscribed = True
+                    last_reconnect_reason = "connected"
+                    backoff = 0.5
+
+                    # Reset notify age at connect
+                    last_notify_ms = now_ms()
+
+                    ping_t = asyncio.create_task(ping_task(client))
+                    wd_t = asyncio.create_task(watchdog_task(client))
+
+                    print("[BLE] Recording... Ctrl+C to stop")
+
+                    try:
+                        while not reconnect_evt.is_set():
+                            await asyncio.sleep(0.25)
+                    except KeyboardInterrupt:
+                        print("\n[INFO] Stopping...")
+                        break
+                    finally:
+                        subscribed = False
+                        try:
+                            await client.stop_notify(NUS_TX_UUID)
+                        except Exception:
+                            pass
+                        for t in (ping_t, wd_t):
+                            t.cancel()
+                            try:
+                                await t
+                            except Exception:
+                                pass
+
+                    if reconnect_evt.is_set():
+                        raise RuntimeError("WATCHDOG_RECONNECT")
+
             except KeyboardInterrupt:
-                print("\n[INFO] Stopping...")
+                break
+            except Exception as e:
+                reconnects += 1
+                if "WATCHDOG_RECONNECT" not in str(e):
+                    last_reconnect_reason = f"exception:{type(e).__name__}"
 
-            await client.stop_notify(NUS_TX_UUID)
+                # Clear queue to prevent old buffered chunks after reconnect
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                        q.task_done()
+                except Exception:
+                    pass
+
+                sleep_s = min(float(args.max_backoff_sec), backoff)
+                print(f"[BLE] Reconnecting in {sleep_s:.1f}s (reason={last_reconnect_reason})")
+                await asyncio.sleep(sleep_s)
+                backoff = min(float(args.max_backoff_sec), backoff * 2.0)
 
     finally:
         # Shutdown tasks
@@ -643,16 +789,18 @@ async def main() -> None:
                 pass
 
         # Final flush
-        if emg_rows:
-            emg_csv.writerows(emg_rows)
-        if imu_rows:
-            imu_csv.writerows(imu_rows)
+        try:
+            if emg_rows:
+                emg_csv.writerows(emg_rows)
+            if imu_rows:
+                imu_csv.writerows(imu_rows)
+        except Exception:
+            pass
 
         emg_csv.close()
         imu_csv.close()
         vit_fp.flush()
         vit_fp.close()
-
         print("[DONE] Logs written to", outdir)
 
 
