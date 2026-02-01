@@ -79,7 +79,7 @@ static constexpr uint8_t TLV_VITALS    = 0x03;
 static constexpr uint8_t  IMU_ACC_FSR_G     = 2;    // one of {2,4,8,16}
 static constexpr uint16_t IMU_GYRO_FSR_DPS  = 250;  // one of {250,500,1000,2000}
 
-struct EmgSample { uint16_t env, raw, ref; uint32_t t_us, seq; };
+struct EmgSample { uint16_t env, raw; uint32_t t_us, seq; };
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };
 
 static EmgSample emgBuf[EMG_BUF_SIZE];
@@ -298,7 +298,6 @@ static void emg_timer_cb(void* /*arg*/) {
   s.seq = emgSeq++;
   s.env = analogRead(PIN_ENV);
   s.raw = analogRead(PIN_RAW);
-  s.ref = REF_CONNECTED ? analogRead(PIN_REF) : 0;
   emg_push(s);
 }
 
@@ -491,9 +490,9 @@ bool send_emg_frame(uint16_t maxPayload) {
   const uint16_t emgMetaBytes = 13;
   const uint16_t crcBytes = 2;
 
-  if (maxPayload < (headerBytes + tlvHdrBytes + emgMetaBytes + crcBytes + 6)) return false;
+    if (maxPayload < (headerBytes + tlvHdrBytes + emgMetaBytes + crcBytes + 4)) return false;
 
-  uint16_t maxSamples = (maxPayload - headerBytes - tlvHdrBytes - emgMetaBytes - crcBytes) / 6;
+  uint16_t maxSamples = (maxPayload - headerBytes - tlvHdrBytes - emgMetaBytes - crcBytes) / 4;
   if (maxSamples == 0) return false;
 
   uint16_t have = emg_available();
@@ -531,18 +530,17 @@ bool send_emg_frame(uint16_t maxPayload) {
   if (off > 32767) off = 32767; if (off < -32768) off = -32768;
   wr_i16(p, (int16_t)off);
   wr_u16(p, EMG_RATE_HZ);
-  *p++ = 3; // channels
-  *p++ = REF_CONNECTED ? 0x07 : 0x03;
+    *p++ = 2; // channels
+  *p++ = 0x03;
   *p++ = 0;
   wr_u16(p, N);
 
-  for (uint16_t i = 0; i < N; i++) {
+    for (uint16_t i = 0; i < N; i++) {
     wr_u16(p, batch[i].env);
     wr_u16(p, batch[i].raw);
-    wr_u16(p, batch[i].ref);
   }
 
-  uint16_t tlvLen = emgMetaBytes + 6 * N;
+  uint16_t tlvLen = emgMetaBytes + 4 * N;
   tlvLenPos[0] = tlvLen & 0xFF;
   tlvLenPos[1] = tlvLen >> 8;
 
