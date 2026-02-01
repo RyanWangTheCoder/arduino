@@ -175,10 +175,38 @@ def decode_imu(val: bytes, ver: int, flags: int):
 
 
 def decode_vitals(val: bytes) -> Dict[str, Optional[float]]:
-    spo2_u16, hr_x10_u16, age_ms, flags, bright = struct.unpack_from("<HHHBB", val, 0)
+    """Decode Vitals TLV payload (with battery data, backward compatible)."""
+    if len(val) < 11:
+        # Old format (no battery) - backward compatible
+        if len(val) >= 8:
+            spo2_u16, hr_x10_u16, age_ms, flags, bright = struct.unpack_from("<HHHBB", val, 0)
+            spo2 = None if spo2_u16 == 0xFFFF else float(spo2_u16)
+            hr = None if hr_x10_u16 == 0xFFFF else float(hr_x10_u16) / 10.0
+            return {
+                "spo2": spo2,
+                "hr": hr,
+                "age_ms": int(age_ms),
+                "flags": int(flags),
+                "brightness": int(bright),
+                "battery_pct": None,  # Not available in old format
+                "battery_v": None,
+            }
+        return {}
+    
+    # New format (with battery) - 11 bytes
+    spo2_u16, hr_x10_u16, age_ms, flags, bright, batt_pct, batt_mv = struct.unpack_from("<HHHBBBH", val, 0)
     spo2 = None if spo2_u16 == 0xFFFF else float(spo2_u16)
     hr = None if hr_x10_u16 == 0xFFFF else float(hr_x10_u16) / 10.0
-    return {"spo2": spo2, "hr": hr, "age_ms": int(age_ms), "flags": int(flags), "brightness": int(bright)}
+    
+    return {
+        "spo2": spo2,
+        "hr": hr,
+        "age_ms": int(age_ms),
+        "flags": int(flags),
+        "brightness": int(bright),
+        "battery_pct": int(batt_pct) if batt_pct < 255 else None,  # 255 = unknown
+        "battery_v": float(batt_mv) / 1000.0 if batt_mv > 0 else None,  # 0 = unknown
+    }
 
 
 class DeviceClockExtender:
@@ -301,6 +329,9 @@ class RecorderState:
     last_reconnect_reason: str
     subscribed: bool
 
+    last_battery_pct: Optional[int]
+    last_battery_v: Optional[float]
+
     emg_rows: List[List]
     imu_rows: List[List]
     last_meta_write: float
@@ -410,13 +441,29 @@ async def health_task(st: RecorderState, args: argparse.Namespace) -> None:
             seg_idx = int(st.emg_csv.idx)
             seg_off = fmt_mmss(time.time() - float(st.emg_csv.t_open))
 
+        # Format battery string
+        if st.last_battery_pct is not None:
+            batt_str = f"batt={st.last_battery_pct}%"
+            if st.last_battery_v is not None:
+                batt_str += f" ({st.last_battery_v:.2f}V)"
+        else:
+            batt_str = "batt=N/A"
+
         print(
             f"[Health] seg={seg_idx} off={seg_off} state={state} conn_sub={int(st.subscribed)} "
             f"fps={fps} notify/s={nps} rx_kB/s={bps/1024.0:.1f} q={st.q.qsize()} "
             f"crc={st.stats.crc_errors} q_drop={st.stats.queue_drops} imu_sat={st.stats.imu_sat} "
+            f"{batt_str}  "
             f"last_notify={age_notify}ms last_good={age_good}ms ping_age={age_pingok}ms ping_fail={st.ping_fail} "
             f"gaps/s={gaps_s} recon={st.reconnects} reason={st.last_reconnect_reason}"
         )
+        
+        # Low battery warnings
+        if st.last_battery_pct is not None:
+            if st.last_battery_pct < 20:
+                print(f"[WARN] Battery low: {st.last_battery_pct}% - Consider stopping recording soon.")
+            if st.last_battery_pct < 10:
+                print(f"[CRITICAL] Battery critical: {st.last_battery_pct}% - Recording may stop soon!")
 
 
 async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
@@ -521,11 +568,32 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
                         vit = decode_vitals(v)
                         age_ms = int(vit["age_ms"]) if vit["age_ms"] is not None else 65535
                         dev_computed_us = dev_frame_us - int(age_ms) * 1000
+                        
+                        # Update cached battery values for health report
+                        if vit.get("battery_pct") is not None:
+                            st.last_battery_pct = int(vit["battery_pct"])
+                        if vit.get("battery_v") is not None:
+                            st.last_battery_v = float(vit["battery_v"])
+                        
+                                                # Send vitals to UDP plotter
+                        if st.udp_sock is not None:
+                            udp_send(st, {
+                                "k": "vitals",
+                                "pct": int(vit["battery_pct"]) if vit.get("battery_pct") is not None else None,
+                                "v": float(vit["battery_v"]) if vit.get("battery_v") is not None else None,
+                                "spo2": int(vit["spo2"]) if vit.get("spo2") is not None else None,
+                                "hr": float(vit["hr"]) if vit.get("hr") is not None else None,
+                                "seg": int(st.emg_csv.idx)
+                            })
+                        
+                        
                         st.vit_w.writerow([
                             int(dev_frame_us), int(dev_computed_us),
                             "" if vit["spo2"] is None else f"{vit['spo2']:.0f}",
                             "" if vit["hr"] is None else f"{vit['hr']:.1f}",
                             int(age_ms), int(vit["flags"]), int(vit["brightness"]),
+                            "" if vit["battery_pct"] is None else int(vit["battery_pct"]),
+                            "" if vit["battery_v"] is None else f"{vit['battery_v']:.2f}",
                             int(frame_seq), host_rx
                         ])
 
@@ -559,12 +627,12 @@ async def main() -> None:
         udp_target = (str(args.udp_host), int(args.udp_port))
         print(f"[UDP] Enabled -> {udp_target[0]}:{udp_target[1]} (RAW~{args.udp_raw_hz}Hz ENV~{args.udp_env_hz}Hz IMU~{args.udp_imu_hz}Hz)")
 
-    # Vitals CSV
+        # Vitals CSV
     vitals_path = outdir / "vitals_log.csv"
     vit_fp = open(vitals_path, "a", newline="", encoding="utf-8")
     vit_w = csv.writer(vit_fp)
     if vit_fp.tell() == 0:
-        vit_w.writerow(["dev_us_frame", "dev_us_computed", "spo2", "hr_bpm", "age_ms", "flags", "brightness", "frame_seq", "host_rx_ms"])
+        vit_w.writerow(["dev_us_frame", "dev_us_computed", "spo2", "hr_bpm", "age_ms", "flags", "brightness", "battery_pct", "battery_v", "frame_seq", "host_rx_ms"])
     print(f"[CSV] Logging vitals to {vitals_path}")
 
     started_host_ms = now_ms()
@@ -598,6 +666,8 @@ async def main() -> None:
         reconnects=0,
         last_reconnect_reason="",
         subscribed=False,
+        last_battery_pct=None,
+        last_battery_v=None,
         emg_rows=[],
         imu_rows=[],
         last_meta_write=0.0,

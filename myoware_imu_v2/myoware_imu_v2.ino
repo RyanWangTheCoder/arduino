@@ -12,8 +12,11 @@
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
 
+// Battery fuel gauge
+#include <SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library.h>
+
 // ==================== LED State Machine Types (MUST be above prototypes) ====================
-enum LedMode : uint8_t { LED_DISCONNECTED, LED_WAIT_HOST, LED_STREAMING, LED_BACKLOG };
+enum LedMode : uint8_t { LED_DISCONNECTED, LED_WAIT_HOST, LED_STREAMING, LED_BACKLOG, LED_LOW_BATTERY };
 
 // Forward declarations (avoid Arduino auto-prototype issues)
 static void led_set(bool on);
@@ -88,6 +91,15 @@ static volatile uint16_t emgHead = 0, emgTail = 0;
 static volatile uint16_t imuHead = 0, imuTail = 0;
 static volatile uint32_t emgSeq = 0, imuSeq = 0;
 static volatile uint32_t emgDropped = 0, imuDropped = 0;
+
+// Battery state structure
+struct BatteryState {
+    float pct;          // 0-100%, or NaN if unavailable
+    float voltage;      // Volts, or NaN if unavailable
+    float changeRate;   // %/hr, or NaN if unavailable
+    bool isLow;         // Low battery alert
+    bool isValid;       // True if data is valid
+};
 
 static portMUX_TYPE emgMux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE imuMux = portMUX_INITIALIZER_UNLOCKED;
@@ -190,6 +202,15 @@ static constexpr uint8_t AD0_VAL = 1;
 MAX30105 maxSensor;
 static constexpr uint8_t MAX3010X_ADDR = 0x57;
 
+// MAX17048 Battery Fuel Gauge
+SFE_MAX1704X lipo(MAX1704X_MAX17048);
+static bool batteryAvailable = false;
+static float lastBatteryPct = 100.0f;
+static float lastBatteryVoltage = 4.2f;
+static uint32_t lastBatteryReadMs = 0;
+static constexpr uint32_t BATTERY_READ_INTERVAL_MS = 10000;  // Read every 10 seconds
+static bool batteryInitialReadDone = false;  // Track if we've done the first read
+
 // SpO2 algorithm buffers
 static constexpr int SPO2_BUFFER_SIZE = 100; // 4 sec @ 25 Hz
 static uint32_t irBuffer[SPO2_BUFFER_SIZE];
@@ -202,6 +223,93 @@ static constexpr byte BRIGHTNESS_MAX = 0x7F;
 static constexpr uint32_t SATURATION_HIGH = 200000;
 static constexpr uint32_t SATURATION_LOW  = 10000;
 
+
+
+BatteryState readBattery() {
+    BatteryState state;
+    state.pct = NAN;
+    state.voltage = NAN;
+    state.changeRate = NAN;
+    state.isLow = false;
+    state.isValid = false;
+    
+    // Check if battery monitor is available
+    if (!batteryAvailable) {
+        return state;  // Return invalid state
+    }
+    
+    // Try to read (SparkFun library has built-in I2C timeout)
+    state.pct = lipo.getSOC();
+    state.voltage = lipo.getVoltage();
+    state.changeRate = lipo.getChangeRate();
+    state.isLow = lipo.isLow();
+    
+    // Validate readings (sanity check)
+    if (state.pct < 0.0f || state.pct > 100.0f) {
+        state.pct = NAN;
+    }
+    if (state.voltage < 2.5f || state.voltage > 4.5f) {
+        state.voltage = NAN;
+    }
+    
+    // Mark as valid if at least one field is good
+    state.isValid = !isnan(state.pct) || !isnan(state.voltage);
+    
+    // Cache for fallback
+    if (!isnan(state.pct)) lastBatteryPct = state.pct;
+    if (!isnan(state.voltage)) lastBatteryVoltage = state.voltage;
+    
+    return state;
+}
+
+void printBatteryStatus() {
+    if (!batteryAvailable) {
+        Serial.println("[Battery] N/A (MAX17048 not detected)");
+        return;
+    }
+    
+    BatteryState batt = readBattery();
+    
+    if (!batt.isValid) {
+        Serial.println("[Battery] ERROR (failed to read)");
+        return;
+    }
+    
+    Serial.print("[Battery] ");
+    
+    if (!isnan(batt.pct)) {
+        Serial.print(batt.pct, 1);
+        Serial.print("%");
+    } else {
+        Serial.print("?%");
+    }
+    
+    Serial.print(" (");
+    if (!isnan(batt.voltage)) {
+        Serial.print(batt.voltage, 2);
+        Serial.print("V");
+    } else {
+        Serial.print("?.??V");
+    }
+    Serial.print(")");
+    
+    if (!isnan(batt.changeRate)) {
+        if (batt.changeRate > 0) {
+            Serial.print(" ↑+");
+        } else {
+            Serial.print(" ↓");
+        }
+        Serial.print(batt.changeRate, 1);
+        Serial.print("%/hr");
+    }
+    
+    if (batt.isLow) {
+        Serial.print(" [LOW!]");
+    }
+    
+    Serial.println();
+}
+
 // Shared vitals state (written by task, read by BLE loop)
 struct VitalsState {
   uint16_t spo2_u16;       // 0..100 or 0xFFFF invalid
@@ -209,8 +317,10 @@ struct VitalsState {
   uint32_t computed_ms;    // millis() when computed
   uint8_t  flags;          // bit0 spo2Valid, bit1 hrValid
   byte     brightness;
+  uint8_t  battery_pct;    // Battery percentage (0-100 or 255 if unknown)
+  uint16_t battery_mv;     // Battery voltage in millivolts (0 if unknown)
 };
-static VitalsState vitals = {0xFFFF, 0xFFFF, 0, 0, ledBrightness};
+static VitalsState vitals = {0xFFFF, 0xFFFF, 0, 0, ledBrightness, 255, 0};
 static portMUX_TYPE vitalsMux = portMUX_INITIALIZER_UNLOCKED;
 static bool max3010xPresent = false;
 
@@ -646,15 +756,47 @@ bool send_imu_frame(uint16_t maxPayload) {
 bool send_vitals_frame(uint16_t maxPayload) {
   const uint16_t headerBytes = 14;
   const uint16_t tlvHdrBytes = 3;
-  const uint16_t vitalsBytes = 8;  // spo2(2) hr_x10(2) age_ms(2) flags(1) bright(1)
+  const uint16_t vitalsBytes = 11;  // spo2(2) hr_x10(2) age_ms(2) flags(1) bright(1) batt_pct(1) batt_mv(2)
   const uint16_t crcBytes = 2;
 
   if (maxPayload < (headerBytes + tlvHdrBytes + vitalsBytes + crcBytes)) return false;
 
-  VitalsState v;
+    VitalsState v;
   portENTER_CRITICAL(&vitalsMux);
   v = vitals;
   portEXIT_CRITICAL(&vitalsMux);
+
+      // Read battery periodically (or immediately on first call)
+  uint32_t nowMs = millis();
+  if (!batteryInitialReadDone || (nowMs - lastBatteryReadMs) >= BATTERY_READ_INTERVAL_MS) {
+    lastBatteryReadMs = nowMs;
+    batteryInitialReadDone = true;
+    
+        if (batteryAvailable) {
+      BatteryState batt = readBattery();
+      
+      if (batt.isValid && !isnan(batt.pct)) {
+        v.battery_pct = (uint8_t)constrain((int)batt.pct, 0, 100);
+      } else {
+        v.battery_pct = 255;  // Unknown
+      }
+      
+      if (batt.isValid && !isnan(batt.voltage)) {
+        v.battery_mv = (uint16_t)(batt.voltage * 1000.0f);
+      } else {
+        v.battery_mv = 0;  // Unknown
+      }
+      
+      // Update cached vitals
+      portENTER_CRITICAL(&vitalsMux);
+      vitals.battery_pct = v.battery_pct;
+      vitals.battery_mv = v.battery_mv;
+      portEXIT_CRITICAL(&vitalsMux);
+    } else {
+      v.battery_pct = 255;  // MAX17048 not available
+      v.battery_mv = 0;
+    }
+  }
 
   uint16_t age_ms = 0;
   uint32_t now = millis();
@@ -683,11 +825,13 @@ bool send_vitals_frame(uint16_t maxPayload) {
   *p++ = TLV_VITALS;
   wr_u16(p, vitalsBytes);
 
-  wr_u16(p, v.spo2_u16);
+    wr_u16(p, v.spo2_u16);
   wr_u16(p, v.hr_x10_u16);
   wr_u16(p, age_ms);
   *p++ = v.flags;
   *p++ = (uint8_t)v.brightness;
+  *p++ = v.battery_pct;    // Battery percentage
+  wr_u16(p, v.battery_mv); // Battery voltage (mV)
 
   uint16_t payloadLen = (uint16_t)(p - payload_start);
   buf[12] = payloadLen & 0xFF;
@@ -751,8 +895,15 @@ static void led_update(LedMode mode) {
       led_set(true);
     } break;
 
-    case LED_BACKLOG: {
+        case LED_BACKLOG: {
       if (now - ledLastMs >= 62) {
+        ledLastMs = now;
+        led_set(!digitalRead(PIN_LED));
+      }
+    } break;
+
+    case LED_LOW_BATTERY: {
+      if (now - ledLastMs >= 100) {  // Very fast blink (10 Hz)
         ledLastMs = now;
         led_set(!digitalRead(PIN_LED));
       }
@@ -801,7 +952,7 @@ void setup() {
     Serial.printf("[IMU] Set FSR: acc=+/- %ug, gyro=+/- %udps\n", IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
   }
 
-  // ---- MAX3010x init (non-fatal if missing) ----
+    // ---- MAX3010x init (non-fatal if missing) ----
   Serial.println("Initializing MAX3010x...");
   if (maxSensor.begin(Wire, I2C_SPEED_FAST, MAX3010X_ADDR)) {
     max3010xPresent = true;
@@ -810,6 +961,42 @@ void setup() {
   } else {
     max3010xPresent = false;
     Serial.println("[WARN] MAX3010x not found; continuing without SpO2/HR.");
+  }
+
+    // ---- MAX17048 Battery init (non-fatal if missing) ----
+  Serial.print("[Battery] Checking for MAX17048... ");
+  if (lipo.begin() == false) {
+    Serial.println("NOT FOUND. Battery monitoring disabled.");
+    batteryAvailable = false;
+  } else {
+    Serial.println("OK.");
+    batteryAvailable = true;
+    
+    // Configure alerts
+    lipo.setThreshold(20);  // Alert at 20% battery
+    lipo.enableSOCAlert();  // Enable 1% change alerts
+    
+    // Optional: Set voltage thresholds
+    lipo.setVALRTMax((float)4.1);  // High voltage alert (4.1V)
+    lipo.setVALRTMin((float)3.3);  // Low voltage alert (3.3V)
+    
+    // Read initial state and update vitals
+    float pct = lipo.getSOC();
+    float volt = lipo.getVoltage();
+    Serial.print("[Battery] Initial: ");
+    Serial.print(pct, 1);
+    Serial.print("% (");
+    Serial.print(volt, 2);
+    Serial.println("V)");
+    
+    lastBatteryPct = pct;
+    lastBatteryVoltage = volt;
+    
+    // Initialize vitals struct with battery data
+    portENTER_CRITICAL(&vitalsMux);
+    vitals.battery_pct = (uint8_t)constrain((int)pct, 0, 100);
+    vitals.battery_mv = (uint16_t)(volt * 1000.0f);
+    portEXIT_CRITICAL(&vitalsMux);
   }
 
   // ---- BLE init ----
@@ -917,19 +1104,32 @@ void loop() {
     }
   }
 
-  // ---- Decide LED mode ----
+    // ---- Decide LED mode ----
   LedMode mode = LED_DISCONNECTED;
-  if (!isConnected) {
-    mode = LED_DISCONNECTED;
-  } else if (samplingPaused) {
-    mode = LED_WAIT_HOST;
-  } else {
-    if (emg_available() > EMG_BACKLOG_PAUSE_THRESH || imu_available() > IMU_BACKLOG_PAUSE_THRESH) {
-      mode = LED_BACKLOG;
-    } else {
-      mode = LED_STREAMING;
+  
+  // Priority 1: Check for low battery first
+  if (batteryAvailable) {
+    BatteryState batt = readBattery();
+    if (batt.isValid && !isnan(batt.pct) && batt.pct < 20.0f) {
+      mode = LED_LOW_BATTERY;
     }
   }
+  
+  // Priority 2: Other states (only if not low battery)
+  if (mode != LED_LOW_BATTERY) {
+    if (!isConnected) {
+      mode = LED_DISCONNECTED;
+    } else if (samplingPaused) {
+      mode = LED_WAIT_HOST;
+    } else {
+      if (emg_available() > EMG_BACKLOG_PAUSE_THRESH || imu_available() > IMU_BACKLOG_PAUSE_THRESH) {
+        mode = LED_BACKLOG;
+      } else {
+        mode = LED_STREAMING;
+      }
+    }
+  }
+  
   led_update(mode);
 
   // ---- TX loop ----
@@ -944,10 +1144,10 @@ void loop() {
       sent |= send_imu_frame(maxNotifyPayload);
     }
 
-    if (nowMs - lastVitalsSendMs >= 30000) {
-      lastVitalsSendMs = nowMs;
-      sent |= send_vitals_frame(maxNotifyPayload);
-    }
+                if (nowMs - lastVitalsSendMs >= 30000) {  // Send Vitals every 30 seconds
+        lastVitalsSendMs = nowMs;
+        sent |= send_vitals_frame(maxNotifyPayload);
+      }
 
     if (sent) framesSent++;
   }
@@ -963,8 +1163,11 @@ void loop() {
     v = vitals;
     portEXIT_CRITICAL(&vitalsMux);
 
-    String sSpo2 = (v.flags & 0x01) ? String(v.spo2_u16) : "NA";
+        String sSpo2 = (v.flags & 0x01) ? String(v.spo2_u16) : "NA";
     String sHr   = (v.flags & 0x02) ? String(v.hr_x10_u16 / 10.0f, 1) : "NA";
+
+    // Print battery status
+    printBatteryStatus();
 
     Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
                   negotiatedMTU, emg_available(), imu_available(),

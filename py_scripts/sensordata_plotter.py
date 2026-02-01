@@ -13,6 +13,8 @@ UDP messages expected (JSON):
     {"k":"env", "dev_us":<int>, "env":<int>, "seg":<int>, "t":<host_ms optional>}
   IMU samples:
     {"k":"imu", "dev_us":<int>, "amag":<float>, "seg":<int>, "t":<host_ms optional>}
+  Battery (from btCentral vitals):
+    {"k":"battery", "pct":<int>, "v":<float>, "seg":<int>}
 
 Plots (live):
   - EMG subplot: RAW (absolute), ENV_device, ENV_lpf(abs(RAW))
@@ -107,6 +109,9 @@ def run_live(args: argparse.Namespace) -> None:
     emg_sr_hz = None
     emg_ch = None
     env_filter = None
+    
+        # Vitals state
+    last_vitals = {}
 
     emg_win = float(args.emg_window_sec)
     imu_win = float(args.imu_window_sec) if args.imu_window_sec is not None else emg_win
@@ -117,7 +122,7 @@ def run_live(args: argparse.Namespace) -> None:
     (ln_env_dev,) = ax_emg.plot([], [], lw=1.2, label='ENV_device')
     (ln_env_lpf,) = ax_emg.plot([], [], lw=1.4, label='ENV_lpf(abs(RAW))')
 
-    ax_emg.set_title('MyoWare Realtime (UDP, dev_us timebase)')
+    title_text = ax_emg.set_title('Realtime monitoring (dev_us timebase)')
     ax_emg.set_ylabel('ADC (counts)')
     ax_emg.set_ylim(0, float(args.emg_ymax))
     ax_emg.grid(True, alpha=0.3)
@@ -142,7 +147,7 @@ def run_live(args: argparse.Namespace) -> None:
             imu_buf.popleft()
 
     def update(_):
-        nonlocal t0_dev_us, emg_sr_hz, emg_ch, env_filter
+        nonlocal t0_dev_us, emg_sr_hz, emg_ch, env_filter, last_vitals
         last_seg = None
         rx_count = 0
 
@@ -160,9 +165,13 @@ def run_live(args: argparse.Namespace) -> None:
                 continue
 
             k = msg.get('k')
+            if k not in ['raw', 'env', 'imu']:
+                print(f"[Plotter DEBUG] Received packet: {msg}")
             seg = msg.get('seg')
             if seg is not None:
                 last_seg = seg
+
+                        # --- Logic Fix: Process metadata packets FIRST --- 
 
             if k == 'emg_meta':
                 sr = msg.get('sr_hz')
@@ -173,12 +182,18 @@ def run_live(args: argparse.Namespace) -> None:
                         emg_sr_hz = sr
                         emg_ch = ch
                         env_filter = ButterLPF(fs_hz=emg_sr_hz, cutoff_hz=float(args.cutoff_hz))
-                        print(f'[Plotter] EMG meta: sr_hz={emg_sr_hz:.1f} ch={emg_ch}')
-                continue
+                        print(f'[Plotter] EMG meta received: sr_hz={emg_sr_hz:.1f} ch={emg_ch}')
+                continue # Done with this packet
+
+            if k == 'vitals':
+                last_vitals.update(msg) # Merge the new data
+                continue # Done with this packet
+
+            # --- Process data packets (they all have dev_us) ---
 
             dev_us = msg.get('dev_us')
             if dev_us is None:
-                continue
+                continue # Not a valid data packet
             dev_us = int(dev_us)
             if t0_dev_us is None:
                 t0_dev_us = dev_us
@@ -215,6 +230,16 @@ def run_live(args: argparse.Namespace) -> None:
                     continue
                 imu_buf.append((t_sec, float(a)))
 
+            elif k == 'battery':
+                pct = msg.get('pct')
+                v = msg.get('v')
+                if pct is not None:
+                    last_battery_pct = int(pct)
+                    print(f'[Plotter] Battery: {last_battery_pct}%')  # DEBUG
+                if v is not None:
+                    last_battery_v = float(v)
+                    print(f'[Plotter] Voltage: {last_battery_v:.2f}V')  # DEBUG
+
             rx_count += 1
 
         now_t = 0.0
@@ -250,6 +275,41 @@ def run_live(args: argparse.Namespace) -> None:
 
         seg_str = f'seg={last_seg}' if last_seg is not None else 'seg=?'
         sr_str = f'sr={emg_sr_hz:.0f}Hz' if emg_sr_hz else 'sr=?'
+        
+                        # Update title with vitals info
+        if last_vitals:
+            parts = []
+            # Battery
+            if last_vitals.get('pct') is not None:
+                batt_str = f"BATTERY: {last_vitals['pct']}%"
+                if last_vitals.get('v') is not None:
+                    batt_str += f" ({last_vitals['v']:.2f}V)"
+                parts.append(batt_str)
+            
+            # SpO2
+            if last_vitals.get('spo2') is not None:
+                parts.append(f"SpO2: {last_vitals['spo2']}%")
+
+            # Heart Rate
+            if last_vitals.get('hr') is not None:
+                parts.append(f"HR: {last_vitals['hr']:.1f} bpm")
+
+            # Set title and color
+            title_text.set_text('Realtime Monitoring | ' + ' | '.join(parts))
+            batt_pct_for_color = last_vitals.get('pct', 100)
+            if batt_pct_for_color < 20:
+                batt_color = 'red'
+            elif batt_pct_for_color < 50:
+                batt_color = 'orange'
+            else:
+                batt_color = 'green'
+            title_text.set_color(batt_color)
+            title_text.set_fontweight('bold')
+        else:
+            title_text.set_text('Realtime Monitoring [Waiting for Vitals...]')
+            title_text.set_color('black')
+            title_text.set_fontweight('normal')
+        
         status.set_text(f'UDP {args.listen_host}:{args.listen_port}  {seg_str}  {sr_str}  rx={rx_count}')
         return ln_raw, ln_env_dev, ln_env_lpf, ln_imu, status
 

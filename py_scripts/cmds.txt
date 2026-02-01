@@ -1,0 +1,9 @@
+python ..\..\emg_util\emg_util_yaml_runner.py --config config.yaml --log-dir ..\arduino\py_scripts\logs_new\
+python ..\..\emg_util\emg_util_yaml_runner.py --config config_fast.yaml --log-dir ..\arduino\py_scripts\logs_new\
+
+capture:
+python btCentral.py --name MyoW1 --outdir logs_new --rotate-min 20 --udp-enable 
+python sensordata_plotter.py --mode live --infer-sr
+
+Saturation check:
+python sensordata_plotter.py --mode offline --emg-file emg_log_20260131_235524_20260131_235538_000 --emg-ymax 4095 --max-points 100000
