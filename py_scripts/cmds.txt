@@ -1,5 +1,5 @@
-python ..\..\emg_util\emg_util_yaml_runner.py --config config.yaml --log-dir ..\arduino\py_scripts\logs_new\
-python ..\..\emg_util\emg_util_yaml_runner.py --config config_fast.yaml --log-dir ..\arduino\py_scripts\logs_new\
+python emg_util_yaml_runner.py --config config.yaml --log-dir ..\arduino\py_scripts\logs_new\
+python emg_util_yaml_runner.py --config config_fast.yaml --log-dir ..\arduino\py_scripts\logs_new\
 
 capture:
 python btCentral.py --name MyoW1 --outdir logs_new --rotate-min 20 --udp-enable 
