@@ -5,5 +5,10 @@ capture:
 python btCentral.py --name MyoW1 --outdir logs_new --rotate-min 20 --udp-enable 
 python sensordata_plotter.py --mode live --infer-sr
 
+# Live mode with fatigue monitoring (default path = C:\wangx\ftc\emg_util)
+python sensordata_plotter.py --mode live --fatigue --imu-thr-dps 150 --fatigue-warmup-min 0
+# Explicit path
+python sensordata_plotter.py --mode live --fatigue --emg-util-path C:\wangx\ftc\emg_util
+
 Saturation check:
 python sensordata_plotter.py --mode offline --emg-file emg_log_20260131_235524_20260131_235538_000 --emg-ymax 4095 --max-points 100000

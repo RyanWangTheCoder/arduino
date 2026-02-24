@@ -549,7 +549,7 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
                         if sr_hz:
                             st.imu_decim = max(1, int(int(sr_hz) // max(1, int(st.udp_imu_hz))))
 
-                        acc_lsb_per_g, _ = imu_scale_factors(cur_acc_fsr_g, cur_gyro_fsr_dps)
+                        acc_lsb_per_g, gyro_lsb_per_dps = imu_scale_factors(cur_acc_fsr_g, cur_gyro_fsr_dps)
 
                         for i in range(samples.shape[0]):
                             s = samples[i, :]
@@ -559,7 +559,8 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
 
                             if st.udp_sock is not None and ((seq0 + i) % st.imu_decim) == 0:
                                 amag = ((ax * ax + ay * ay + az * az) ** 0.5) / float(acc_lsb_per_g)
-                                udp_send(st, {"k": "imu", "dev_us": int(dev_us), "t": host_rx, "amag": amag, "seg": int(st.emg_csv.idx)})
+                                gmag = ((gx * gx + gy * gy + gz * gz) ** 0.5) / float(gyro_lsb_per_dps)
+                                udp_send(st, {"k": "imu", "dev_us": int(dev_us), "t": host_rx, "amag": amag, "gmag": gmag, "seg": int(st.emg_csv.idx)})
 
                             if is_imu_saturated(s):
                                 st.stats.imu_sat += 1
