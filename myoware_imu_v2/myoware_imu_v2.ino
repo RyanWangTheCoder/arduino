@@ -48,16 +48,6 @@ static constexpr int PIN_RAW = 32; // A4 (ADC1)
 static constexpr int PIN_REF = 33; // A5 (ADC1)
 static constexpr bool REF_CONNECTED = false;
 
-// ADC continuous (DMA) config
-// PIN_ENV=39 → ADC1 channel 3, PIN_RAW=32 → ADC1 channel 4
-static constexpr adc_channel_t ADC_CH_ENV = ADC_CHANNEL_3;
-static constexpr adc_channel_t ADC_CH_RAW = ADC_CHANNEL_4;
-// Conversion rate: driver samples each channel in round-robin, so set
-// freq = EMG_RATE_HZ * num_channels to get EMG_RATE_HZ per channel.
-static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 conversions/s total
-static constexpr uint32_t ADC_FRAME_SIZE   = 256;               // bytes per DMA frame (must be multiple of SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
-static adc_continuous_handle_t adcHandle   = nullptr;
-
 // ==================== Rates ====================
 static constexpr uint32_t EMG_RATE_HZ = 2000;
 static constexpr uint32_t IMU_RATE_HZ = 200;
@@ -70,6 +60,17 @@ static constexpr uint16_t IMU_BUF_SIZE = 512;
 
 // Debug print
 static constexpr uint32_t HEALTH_REPORT_MS = 1000;
+
+// ==================== ADC Continuous (DMA) config ====================
+// Placed after EMG_RATE_HZ so the constexpr multiply is valid.
+// PIN_ENV=39 → ADC1 channel 3, PIN_RAW=32 → ADC1 channel 4
+static constexpr adc_channel_t ADC_CH_ENV  = ADC_CHANNEL_3;
+static constexpr adc_channel_t ADC_CH_RAW  = ADC_CHANNEL_4;
+// Round-robin over 2 channels: total conv rate = EMG_RATE_HZ * 2
+static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 conv/s
+// 256 bytes / sizeof(adc_digi_output_data_t=4) = 64 results per DMA frame
+static constexpr uint32_t ADC_FRAME_SIZE   = 256;
+static adc_continuous_handle_t adcHandle   = nullptr;
 
 // ==================== Protocol ====================
 static constexpr uint8_t MAGIC0 = 0xA5;
@@ -409,11 +410,11 @@ static volatile bool samplingPaused = true;
 static void emg_adc_init() {
   if (adcHandle != nullptr) return; // already running
 
-  adc_continuous_handle_cfg_t handleCfg = {
-    .max_store_buf_size = ADC_FRAME_SIZE * 4,  // internal ring buffer
-    .conv_frame_size    = ADC_FRAME_SIZE,
-    .flags              = { .flush_pool = 0 },
-  };
+    // Zero-init first to avoid nested designated-initializer warnings in C++
+  adc_continuous_handle_cfg_t handleCfg = {};
+  handleCfg.max_store_buf_size = ADC_FRAME_SIZE * 4;  // internal ring buffer
+  handleCfg.conv_frame_size    = ADC_FRAME_SIZE;
+  // handleCfg.flags.flush_pool = 0 is already 0 from zero-init above
   ESP_ERROR_CHECK(adc_continuous_new_handle(&handleCfg, &adcHandle));
 
   // Two channels: ENV and RAW, both on ADC1, 12-bit, 11dB attenuation
@@ -532,13 +533,16 @@ void emgDrainTask(void* /*param*/) {
       continue;
     }
 
-    uint32_t numResults = bytesRead / SOC_ADC_DIGI_RESULT_BYTES;
+        // sizeof(adc_digi_output_data_t) replaces SOC_ADC_DIGI_RESULT_BYTES (removed in IDF 5.x)
+    uint32_t numResults = bytesRead / sizeof(adc_digi_output_data_t);
     adc_digi_output_data_t* results = (adc_digi_output_data_t*)dmaBuf;
 
     for (uint32_t i = 0; i < numResults; i++) {
       adc_digi_output_data_t* r = &results[i];
-      uint8_t  ch  = r->type2.channel;
-      uint16_t val = r->type2.data;  // 12-bit result
+      // .type2 union member was removed in IDF 5.x; use .val with bit extraction instead.
+      // FORMAT_TYPE2 on original ESP32: bits[15:12]=channel, bits[11:0]=12-bit data
+      uint8_t  ch  = (uint8_t)((r->val >> 12) & 0x0F);
+      uint16_t val = (uint16_t)(r->val & 0x0FFF);
 
       if (ch == ADC_CH_ENV) {
         envVal   = val;
