@@ -19,7 +19,7 @@ Fatigue monitoring (--fatigue):
   - Triggers on IMU gyro magnitude >= --imu-thr-dps (default 150 dps) with 300ms debounce
   - Calls FatigueMonitor.push_swing() in a background thread (same class as Android)
   - Displays: text annotation on EMG plot + 3rd MDF trend subplot
-  - FatigueMonitor is imported from emg_util_nopandas.py (--emg-util-path)
+  - FatigueMonitor is imported from fatigue_monitor.py (--emg-util-path points to emg_util/ dir)
 
 Usage:
   python sensordata_plotter.py --mode live --fatigue --imu-thr-dps 150 --fatigue-warmup-min 0
@@ -47,10 +47,10 @@ _FatigueMonitor = None  # set by _try_import_fatigue_monitor()
 
 
 def _try_import_fatigue_monitor(path: str) -> bool:
-    """Try to import FatigueMonitor from emg_util at the given directory path.
+    """Try to import FatigueMonitor from fatigue_monitor.py at the given directory path.
 
-    emg_util.py is the primary development location for FatigueMonitor.
-    emg_util_nopandas.py (Android) is kept in sync manually.
+    fatigue_monitor.py is the canonical source (emg_util/fatigue_monitor.py).
+    It is self-contained: zero pandas/matplotlib dependency.
     """
     global _FatigueMonitor
     resolved = os.path.normpath(path) if path else ''
@@ -58,12 +58,12 @@ def _try_import_fatigue_monitor(path: str) -> bool:
         if resolved not in sys.path:
             sys.path.insert(0, resolved)
     try:
-        from emg_util import FatigueMonitor as _FM
+        from fatigue_monitor import FatigueMonitor as _FM
         _FatigueMonitor = _FM
-        print(f'[Fatigue] Loaded FatigueMonitor from emg_util at {resolved}')
+        print(f'[Fatigue] Loaded FatigueMonitor from fatigue_monitor at {resolved}')
         return True
     except ImportError as e:
-        print(f'[Fatigue] WARNING: Could not import FatigueMonitor from emg_util at {resolved!r}: {e}')
+        print(f'[Fatigue] WARNING: Could not import FatigueMonitor from fatigue_monitor at {resolved!r}: {e}')
         return False
 
 
@@ -372,17 +372,26 @@ def run_live(args: argparse.Namespace) -> None:
             if k == 'emg_meta':
                 sr = msg.get('sr_hz')
                 ch = msg.get('ch')
+                meta_seg = msg.get('seg')
                 if sr is not None:
                     sr = float(sr)
                     if (emg_sr_hz is None) or (float(emg_sr_hz) != sr):
                         emg_sr_hz = sr
                         emg_ch = ch
                         env_filter = ButterLPF(fs_hz=emg_sr_hz, cutoff_hz=float(args.cutoff_hz))
-                        # Keep FatigueMonitor fs in sync
-                        if fatigue_enabled and monitor is not None and monitor._fs != sr:
-                            monitor._fs = sr
+                        # Keep FatigueMonitor fs in sync via public setter
+                        if fatigue_enabled and monitor is not None:
+                            monitor.set_fs(sr)
                             print(f'[Fatigue] Updated fs={sr:.0f} Hz')
                         print(f'[Plotter] EMG meta: sr_hz={emg_sr_hz:.1f} ch={emg_ch}')
+                # Reset fatigue monitor on new BLE session (seg=0 after data already seen)
+                # seg=0 means btCentral just started a new BLE connection / CSV rotation 0.
+                if (fatigue_enabled and monitor is not None
+                        and meta_seg == 0 and t0_dev_us is not None):
+                    monitor.reset()
+                    emg_fatigue_buf.clear()
+                    last_imu_trigger_t[0] = -999.0
+                    print('[Fatigue] New BLE session (seg=0) — monitor reset')
                 continue
 
             if k == 'vitals':

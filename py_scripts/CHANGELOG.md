@@ -5,6 +5,29 @@ Format: newest session at the top.
 
 ---
 
+## 2026-02-25 — `sensordata_plotter.py`: Direct `fatigue_monitor` import
+
+### Changed (`sensordata_plotter.py`)
+- `_try_import_fatigue_monitor()`: changed import from `from emg_util import FatigueMonitor`
+  to `from fatigue_monitor import FatigueMonitor`.
+- Module docstring updated to reflect the new import source.
+
+### Motivation
+`FatigueMonitor` was extracted from `emg_util.py` into a standalone `fatigue_monitor.py`
+(see `emg_util/CHANGELOG.md`). Importing directly from `fatigue_monitor` avoids loading
+all of `emg_util.py` (pandas, matplotlib, scipy) just to get `FatigueMonitor`.
+
+`sensordata_plotter.py` only needs `FatigueMonitor` — it has no use for the rest of
+`emg_util`. The `--emg-util-path` argument still points to the `emg_util/` directory,
+which is where `fatigue_monitor.py` lives. No file copy is needed: `_try_import_fatigue_monitor()`
+adds `emg_util/` to `sys.path` at runtime, so `fatigue_monitor.py` is found directly.
+
+Note: the Android copy (`btLeApp/app/src/main/python/fatigue_monitor.py`) is still required
+because Chaquopy can only import Python files physically packaged inside the APK — there is
+no `sys.path` trick available on Android. That copy must be refreshed before each APK build.
+
+---
+
 ## 2025 — Session 2: Reconnect Hygiene + Timestamp Sync Fix (btCentral.py)
 
 ### Root Cause Fix: `DeviceClockExtender` Not Reset on Reconnect
