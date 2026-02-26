@@ -73,7 +73,11 @@ static constexpr uint32_t ADC_FRAME_SIZE   = 256;
 static adc_continuous_handle_t adcHandle   = nullptr;
 // Mutex protecting adcHandle across Core 0 (loop/deinit) and Core 1 (emgDrainTask/read).
 // Must be a FreeRTOS mutex (not portMUX spinlock) because both sides are tasks, not ISRs.
-static SemaphoreHandle_t adcMutex = nullptr;
+static SemaphoreHandle_t adcMutex  = nullptr;
+// Mutex protecting the shared Wire/I2C bus across imuTask (Core 1),
+// spo2Task (Core 1), and loop()/readBattery() (Core 0).
+// Arduino Wire is NOT thread-safe on ESP32.
+static SemaphoreHandle_t wireMutex = nullptr;
 
 // ==================== Protocol ====================
 static constexpr uint8_t MAGIC0 = 0xA5;
@@ -243,17 +247,16 @@ BatteryState readBattery() {
     state.changeRate = NAN;
     state.isLow = false;
     state.isValid = false;
-    
-    // Check if battery monitor is available
-    if (!batteryAvailable) {
-        return state;  // Return invalid state
-    }
-    
-    // Try to read (SparkFun library has built-in I2C timeout)
-    state.pct = lipo.getSOC();
-    state.voltage = lipo.getVoltage();
+
+    if (!batteryAvailable) return state;
+
+    // Guard I2C bus — shared with imuTask and spo2Task
+    if (wireMutex) xSemaphoreTake(wireMutex, portMAX_DELAY);
+    state.pct        = lipo.getSOC();
+    state.voltage    = lipo.getVoltage();
     state.changeRate = lipo.getChangeRate();
-    state.isLow = lipo.isLow();
+    state.isLow      = lipo.isLow();
+    if (wireMutex) xSemaphoreGive(wireMutex);
     
     // Validate readings (sanity check)
     if (state.pct < 0.0f || state.pct > 100.0f) {
@@ -408,6 +411,16 @@ static volatile uint32_t imu_ticks = 0;
 // IMPORTANT: start paused so we don't sample/drop when no host is consuming
 static volatile bool samplingPaused = true;
 
+// Atomic accessors for samplingPaused — written on Core 0, read on Core 1.
+// volatile alone does not guarantee cross-core visibility on Xtensa LX6
+// (no hardware memory barrier). __atomic builtins insert the required barriers.
+static inline void setSamplingPaused(bool v) {
+  __atomic_store_n(&samplingPaused, v, __ATOMIC_RELEASE);
+}
+static inline bool getSamplingPaused() {
+  return __atomic_load_n(&samplingPaused, __ATOMIC_ACQUIRE);
+}
+
 // ==================== ADC Continuous (DMA) helpers ====================
 
 static void emg_adc_init() {
@@ -462,7 +475,7 @@ static void emg_adc_deinit() {
 
 // ==================== IMU timer ====================
 static void imu_timer_cb(void* /*arg*/) {
-  if (samplingPaused) return;
+  if (getSamplingPaused()) return;
   imu_ticks++;
 }
 
@@ -491,14 +504,14 @@ class ServerCallbacks : public BLEServerCallbacks {
 
     rb_flush_all();
     imu_ticks = 0;
-    samplingPaused = true;
+        samplingPaused = true;  // direct assign OK here — BLE callback runs before tasks start
     // ADC DMA will be started by loop() when host heartbeat arrives
   }
 
   void onDisconnect(BLEServer* /*pServer*/) override {
     isConnected = false;
     // Immediately pause sampling to avoid filling buffers while disconnected
-    samplingPaused = true;
+        setSamplingPaused(true);
     emg_adc_deinit();  // stop DMA while disconnected to save power
     clearHostPing();
     rb_flush_all();
@@ -521,7 +534,7 @@ void emgDrainTask(void* /*param*/) {
 
     for (;;) {
         // Guard FIRST: if paused, don't touch the driver
-    if (samplingPaused) {
+        if (getSamplingPaused()) {
       envValid = false;
       rawValid = false;
       vTaskDelay(5 / portTICK_PERIOD_MS);
@@ -593,19 +606,21 @@ void emgDrainTask(void* /*param*/) {
 void imuTask(void* /*param*/) {
   for (;;) {
     if (imu_ticks > 0) {
-      // consume one tick
       imu_ticks--;
-      if (myICM.dataReady()) {
-        myICM.getAGMT();
+      xSemaphoreTake(wireMutex, portMAX_DELAY);
+      bool ready = myICM.dataReady();
+      if (ready) myICM.getAGMT();
+      xSemaphoreGive(wireMutex);
+      if (ready) {
         ImuSample s;
         s.t_us = micros();
-        s.seq = imuSeq++;
-        s.ax = myICM.agmt.acc.axes.x;
-        s.ay = myICM.agmt.acc.axes.y;
-        s.az = myICM.agmt.acc.axes.z;
-        s.gx = myICM.agmt.gyr.axes.x;
-        s.gy = myICM.agmt.gyr.axes.y;
-        s.gz = myICM.agmt.gyr.axes.z;
+        s.seq  = imuSeq++;
+        s.ax   = myICM.agmt.acc.axes.x;
+        s.ay   = myICM.agmt.acc.axes.y;
+        s.az   = myICM.agmt.acc.axes.z;
+        s.gx   = myICM.agmt.gyr.axes.x;
+        s.gy   = myICM.agmt.gyr.axes.y;
+        s.gz   = myICM.agmt.gyr.axes.z;
         imu_push(s);
       }
     }
@@ -633,29 +648,39 @@ void spo2Task(void* /*param*/) {
       continue;
     }
 
-    // Collect 100 samples (~4 sec at 25 Hz)
+        // Collect 100 samples (~4 sec at 25 Hz)
     for (int i = 0; i < SPO2_BUFFER_SIZE; i++) {
-      while (!maxSensor.available()) {
+      bool avail = false;
+      while (!avail) {
+        xSemaphoreTake(wireMutex, portMAX_DELAY);
         maxSensor.check();
-        vTaskDelay(1);
+        avail = maxSensor.available();
+        xSemaphoreGive(wireMutex);
+        if (!avail) vTaskDelay(1);
       }
+      xSemaphoreTake(wireMutex, portMAX_DELAY);
       redBuffer[i] = maxSensor.getRed();
       irBuffer[i]  = maxSensor.getIR();
       maxSensor.nextSample();
+      xSemaphoreGive(wireMutex);
     }
 
     uint32_t lastIR  = irBuffer[SPO2_BUFFER_SIZE - 1];
     uint32_t lastRED = redBuffer[SPO2_BUFFER_SIZE - 1];
 
     // Auto brightness adjust (avoid max<int>/min<int> templates)
-    if (lastIR > SATURATION_HIGH && ledBrightness > BRIGHTNESS_MIN) {
+        if (lastIR > SATURATION_HIGH && ledBrightness > BRIGHTNESS_MIN) {
       int newB = max((int)BRIGHTNESS_MIN, (int)ledBrightness - 0x0F);
       ledBrightness = (byte)newB;
+      xSemaphoreTake(wireMutex, portMAX_DELAY);
       configureMax3010x();
+      xSemaphoreGive(wireMutex);
     } else if (lastIR < SATURATION_LOW && ledBrightness < BRIGHTNESS_MAX) {
       int newB = min((int)BRIGHTNESS_MAX, (int)ledBrightness + 0x0F);
       ledBrightness = (byte)newB;
+      xSemaphoreTake(wireMutex, portMAX_DELAY);
       configureMax3010x();
+      xSemaphoreGive(wireMutex);
     }
 
     // Compute SpO2 and HR
@@ -1165,8 +1190,11 @@ void setup() {
   BLEDevice::startAdvertising();
 
       // Create ADC mutex before any task or init that uses adcHandle
-  adcMutex = xSemaphoreCreateMutex();
-  configASSERT(adcMutex);  // halt if allocation failed (out of heap)
+    // Create mutexes before any task or init that uses the protected resources
+  adcMutex  = xSemaphoreCreateMutex();
+  wireMutex = xSemaphoreCreateMutex();
+  configASSERT(adcMutex);   // halt if heap allocation failed
+  configASSERT(wireMutex);
 
   // ---- Timers ----
   // EMG is now driven by ADC DMA — no EMG timer needed.
@@ -1183,7 +1211,7 @@ void setup() {
   Serial.printf("ADC DMA: %lu Hz/ch x2 ch. IMU timer: %lu Hz\n", (unsigned long)EMG_RATE_HZ, (unsigned long)IMU_RATE_HZ);
 
   // Start paused until first host heartbeat after a BLE connection
-  samplingPaused = true;
+    samplingPaused = true;  // direct assign OK — tasks not started yet
   rb_flush_all();
 }
 
@@ -1213,9 +1241,7 @@ void loop() {
 
   // IMPORTANT: never sample when not connected
   if (!isConnected) {
-        if (!samplingPaused) {
-      samplingPaused = true;
-      emg_adc_deinit();  // stop DMA on disconnect
+            if (!getSamplingPaused()) {
       rb_flush_all();
       imu_ticks = 0;
       Serial.println("[WD] Disconnected. Pausing sampling.");
@@ -1223,16 +1249,14 @@ void loop() {
   } else {
     // Connected: pause if host not alive; resume only when hostAlive
         if (!hostAlive) {
-      if (!samplingPaused) {
-        samplingPaused = true;
-        emg_adc_deinit();  // stop DMA while host is absent
+            if (!getSamplingPaused()) {
         rb_flush_all();
         imu_ticks = 0;
         Serial.printf("[WD] Host heartbeat missing (%lu ms). Pausing sampling/streaming.\n", (unsigned long)hostAge);
       }
     } else {
-            if (samplingPaused) {
-        samplingPaused = false;
+            if (getSamplingPaused()) {
+                setSamplingPaused(false);
         rb_flush_all();
         imu_ticks = 0;
         emg_adc_init();  // start DMA ADC now that host is alive
@@ -1262,7 +1286,7 @@ void loop() {
   if (mode != LED_LOW_BATTERY) {
     if (!isConnected) {
       mode = LED_DISCONNECTED;
-    } else if (samplingPaused) {
+    } else if (getSamplingPaused()) {
       mode = LED_WAIT_HOST;
     } else {
       if (emg_available() > EMG_BACKLOG_PAUSE_THRESH || imu_available() > IMU_BACKLOG_PAUSE_THRESH) {
@@ -1276,7 +1300,7 @@ void loop() {
   led_update(mode);
 
   // ---- TX loop ----
-  if (isConnected && pTXCharacteristic && !samplingPaused) {
+  if (isConnected && pTXCharacteristic && !getSamplingPaused()) {
     bool sent = false;
 
     sent |= send_emg_frame(maxNotifyPayload);
@@ -1315,7 +1339,7 @@ void loop() {
     Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
                   negotiatedMTU, emg_available(), imu_available(),
                   (unsigned long)emgDropped, (unsigned long)imuDropped, (unsigned long)fps,
-                  (unsigned long)hostAge, samplingPaused ? 1 : 0,
+                  (unsigned long)hostAge, getSamplingPaused() ? 1 : 0,
                   sSpo2.c_str(), sHr.c_str());
   }
 
