@@ -567,7 +567,14 @@ void emgDrainTask(void* /*param*/) {
       continue;
     }
 
-        // sizeof(adc_digi_output_data_t) replaces SOC_ADC_DIGI_RESULT_BYTES (removed in IDF 5.x)
+            // Capture frame-end timestamp BEFORE processing results.
+    // Back-calculate each sample's actual ADC capture time:
+    //   sample[i] was captured (numResults-1-i) * (1e6/ADC_CONV_FREQ_HZ) µs before frame end.
+    // This corrects for the up-to-16 ms latency between ADC capture and emgDrainTask wakeup.
+    uint32_t frameEndUs = micros();
+    // Inter-conversion period in µs (250 µs at 4000 conv/s)
+    static constexpr float US_PER_CONV = 1000000.0f / ADC_CONV_FREQ_HZ;
+
     uint32_t numResults = bytesRead / sizeof(adc_digi_output_data_t);
     adc_digi_output_data_t* results = (adc_digi_output_data_t*)dmaBuf;
 
@@ -587,13 +594,17 @@ void emgDrainTask(void* /*param*/) {
       }
       // else: unexpected channel — ignore
 
-      // Emit a paired sample once both channels have been seen
+            // Emit a paired sample once both channels have been seen
       if (envValid && rawValid) {
         EmgSample s;
-        s.t_us   = micros();
-        s.seq    = emgSeq++;
-        s.env    = envVal;
-        s.raw    = rawVal;
+        // Back-calculate actual ADC capture time for this result slot.
+        // result[i] was the i-th conversion; result[numResults-1] is the most recent.
+        // So result[i] was captured (numResults-1-i) * US_PER_CONV µs before frame end.
+        uint32_t age_us = (uint32_t)((numResults - 1u - i) * US_PER_CONV);
+        s.t_us = frameEndUs - age_us;
+        s.seq  = emgSeq++;
+        s.env  = envVal;
+        s.raw  = rawVal;
         emg_push(s);
         envValid = false;
         rawValid = false;
@@ -1239,17 +1250,21 @@ void loop() {
 
   bool hostAlive = (hp != 0) && (hostAge <= HOST_SILENCE_PAUSE_MS);
 
-  // IMPORTANT: never sample when not connected
+    // IMPORTANT: never sample when not connected
   if (!isConnected) {
-            if (!getSamplingPaused()) {
+    if (!getSamplingPaused()) {
+      setSamplingPaused(true);
+      emg_adc_deinit();  // stop DMA on disconnect
       rb_flush_all();
       imu_ticks = 0;
       Serial.println("[WD] Disconnected. Pausing sampling.");
     }
   } else {
     // Connected: pause if host not alive; resume only when hostAlive
-        if (!hostAlive) {
-            if (!getSamplingPaused()) {
+    if (!hostAlive) {
+      if (!getSamplingPaused()) {
+        setSamplingPaused(true);
+        emg_adc_deinit();  // stop DMA while host is absent
         rb_flush_all();
         imu_ticks = 0;
         Serial.printf("[WD] Host heartbeat missing (%lu ms). Pausing sampling/streaming.\n", (unsigned long)hostAge);
