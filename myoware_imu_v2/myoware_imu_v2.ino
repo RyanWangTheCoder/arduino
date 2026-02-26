@@ -1218,10 +1218,13 @@ void setup() {
   esp_timer_start_periodic(imuTimer, IMU_PERIOD_US);
 
   // ---- Tasks ----
-  // emgDrainTask: high priority, Core 1 (same as imuTask — both are I/O bound and short)
+    // Task priorities on Core 1:
+  //   2 = emgDrainTask  — real-time, must drain DMA at 2kHz
+  //   2 = imuTask       — real-time, 200 Hz timer-driven; raised from 1 to prevent SpO2 starvation
+  //   0 = spo2Task      — background, computes every ~30s; lowered from 1, no real-time requirement
   xTaskCreatePinnedToCore(emgDrainTask, "emgDrain", 4096, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(imuTask,      "imuTask",  4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(spo2Task,     "spo2Task", 6144, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(imuTask,      "imuTask",  4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(spo2Task,     "spo2Task", 6144, NULL, 0, NULL, 1);
 
   Serial.printf("ADC DMA: %lu Hz/ch x2 ch. IMU timer: %lu Hz\n", (unsigned long)EMG_RATE_HZ, (unsigned long)IMU_RATE_HZ);
 
