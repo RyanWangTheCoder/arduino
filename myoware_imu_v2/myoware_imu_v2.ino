@@ -396,7 +396,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 };
 
 // ==================== Timers ====================
-static esp_timer_handle_t emgTimer = nullptr;
+// emgTimer removed — EMG sampling is driven by ADC DMA, not a software timer.
 static esp_timer_handle_t imuTimer = nullptr;
 
 // Use counter instead of bool to avoid losing ticks
@@ -434,7 +434,9 @@ static void emg_adc_init() {
     .adc_pattern    = patterns,
     .sample_freq_hz = ADC_CONV_FREQ_HZ,
     .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
-    .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2,  // includes channel tag
+    // TYPE1 is the only format supported on original ESP32 (TYPE2 is for S2/S3 only).
+    // TYPE1 layout: bits[11:0]=12-bit data, bits[15:12]=channel index
+    .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
   };
   ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &adcCfg));
   ESP_ERROR_CHECK(adc_continuous_start(adcHandle));
@@ -449,15 +451,7 @@ static void emg_adc_deinit() {
   Serial.println("[ADC] Continuous DMA stopped.");
 }
 
-// ==================== ADC/EMG sampling ====================
-// emg_timer_cb is now a trivial tick counter — no ADC calls in ISR context.
-// The actual ADC reads happen in emgDrainTask via DMA.
-
-static void emg_timer_cb(void* /*arg*/) {
-  // intentionally empty — EMG sampling is driven by ADC continuous DMA
-  // (kept so the timer infrastructure is unchanged)
-}
-
+// ==================== IMU timer ====================
 static void imu_timer_cb(void* /*arg*/) {
   if (samplingPaused) return;
   imu_ticks++;
@@ -516,17 +510,18 @@ void emgDrainTask(void* /*param*/) {
   uint16_t envVal    = 0;
   uint16_t rawVal    = 0;
 
-  for (;;) {
-    // Block until ADC DMA has data (10 ms timeout keeps task responsive)
-    uint32_t bytesRead = 0;
-    esp_err_t ret = adc_continuous_read(adcHandle, dmaBuf, ADC_FRAME_SIZE, &bytesRead, 10);
-
+    for (;;) {
+    // Guard FIRST: if paused or handle not yet initialised, don't touch the driver
     if (samplingPaused || adcHandle == nullptr) {
       envValid = false;
       rawValid = false;
       vTaskDelay(5 / portTICK_PERIOD_MS);
       continue;
     }
+
+    // Block until ADC DMA has data (10 ms timeout keeps task responsive)
+    uint32_t bytesRead = 0;
+    esp_err_t ret = adc_continuous_read(adcHandle, dmaBuf, ADC_FRAME_SIZE, &bytesRead, 10);
 
     if (ret != ESP_OK || bytesRead == 0) {
       vTaskDelay(1);
@@ -539,8 +534,8 @@ void emgDrainTask(void* /*param*/) {
 
     for (uint32_t i = 0; i < numResults; i++) {
       adc_digi_output_data_t* r = &results[i];
-      // .type2 union member was removed in IDF 5.x; use .val with bit extraction instead.
-      // FORMAT_TYPE2 on original ESP32: bits[15:12]=channel, bits[11:0]=12-bit data
+            // TYPE1 layout on original ESP32 (IDF 5.x): bits[11:0]=data, bits[15:12]=channel
+      // Using .val directly avoids the removed .type1/.type2 union members in IDF 5.x
       uint8_t  ch  = (uint8_t)((r->val >> 12) & 0x0F);
       uint16_t val = (uint16_t)(r->val & 0x0FFF);
 
@@ -1143,13 +1138,8 @@ void setup() {
   pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   BLEDevice::startAdvertising();
 
-    // ---- Timers ----
-  // EMG timer callback is now a no-op; EMG sampling is driven by ADC DMA.
-  // Kept so the timer handle exists (harmless), but could be removed entirely.
-  esp_timer_create_args_t emgArgs = { .callback = &emg_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "emg_timer" };
-  esp_timer_create(&emgArgs, &emgTimer);
-  // Note: emgTimer is NOT started here — EMG is driven by ADC DMA, not a timer tick.
-
+      // ---- Timers ----
+  // EMG is now driven by ADC DMA — no EMG timer needed.
   esp_timer_create_args_t imuArgs = { .callback = &imu_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "imu_timer" };
   esp_timer_create(&imuArgs, &imuTimer);
   esp_timer_start_periodic(imuTimer, IMU_PERIOD_US);
