@@ -214,6 +214,69 @@ Disconnected ──connect──→ Wait Host ──PING──→ Streaming
 
 ---
 
+## 2026 — Session 16: IMU FSR raised — gyro 250→1000 dps, acc 2→4 g (anti-saturation)
+
+### Problem
+Tennis swings saturated both IMU axes at the previous FSR settings:
+
+| Axis | FSR | Saturation limit | Observed median | Status |
+|------|-----|-----------------|-----------------|--------|
+| Gyro | 250 dps | ±32767 LSB = ±250 dps | Clipped on every hard swing | ❌ Saturated |
+| Acc | 2 g | ±32767 LSB = ±2 g | `imu_peak_acc_dyn` median = 2.464g | ❌ Saturated |
+
+**Gyro saturation** clipped `gx/gy/gz` at ±32767 on every hard swing, making gyro-based
+swing detection unreliable. The `peak_mag` and `swing_acc_drop_pct` fatigue indicators
+were computed from clipped data.
+
+**Acc saturation** caused `imu_peak_acc_dyn` to hit the 2g ceiling on most swings,
+preventing meaningful per-swing force tracking.
+
+### Fix
+
+```cpp
+// Before (saturated):
+static constexpr uint8_t  IMU_ACC_FSR_G     = 2;    // saturated at 2g
+static constexpr uint16_t IMU_GYRO_FSR_DPS  = 250;  // saturated on every hard swing
+
+// After:
+static constexpr uint8_t  IMU_ACC_FSR_G     = 4;    // covers 2-4g tennis swing range
+static constexpr uint16_t IMU_GYRO_FSR_DPS  = 1000; // covers 500-1000 dps tennis swing range
+```
+
+**Why these values:**
+- Gyro 1000 dps: tennis swings peak at ~500–1000 dps. Stays in linear range.
+  Resolution: 32.8 LSB/dps (vs 131.0 at 250 dps) — still more than sufficient.
+- Acc 4g: doubles the range from 2g. Resolution: 8192 LSB/g (vs 16384 at 2g).
+  `imu_mean_acc_dyn` (mean `|acc_mag - 1g|`) will no longer saturate.
+
+### Self-Describing Protocol — No Decoder Changes Needed
+Both FSR codes are transmitted in every IMU meta frame (`FLAG_IMU_META_V2`):
+```cpp
+*p++ = accFsrToCode(IMU_ACC_FSR_G);   // 1 = 4g
+*p++ = gyroFsrToCode(IMU_GYRO_FSR_DPS); // 2 = 1000 dps
+```
+`btCentral.py` and `btcentral_offline_decode.py` decode these codes and write
+`acc_fsr_g=4`, `gyro_fsr_dps=1000` per row in the CSV. `capture_loader.py` reads
+per-row FSR for physical-unit conversion. No decoder changes needed.
+
+### Companion Changes (Python side)
+Fallback defaults updated to match new firmware (used for old captures without FSR meta):
+- `btCentral.py`: `cur_acc_fsr_g = 4`, `cur_gyro_fsr_dps = 1000`
+- `emg_util/capture_loader.py`: `acc_fsr_default_g=4.0`, `gyro_fsr_default_dps=1000.0`
+- `emg_util/config.yaml`, `config_fast.yaml`: same
+- `emg_util/tennis_analysis_cloud.ipynb` CLOUD_CONFIG: same
+
+### IMU FSR Lookup Table (Reference)
+
+| Code | Acc FSR | LSB/g | Gyro FSR | LSB/dps |
+|------|---------|-------|----------|---------|
+| 0 | 2g | 16384 | 250 dps | 131.0 |
+| 1 | **4g** ← new | **8192** | 500 dps | 65.5 |
+| 2 | 8g | 4096 | **1000 dps** ← new | **32.8** |
+| 3 | 16g | 2048 | 2000 dps | 16.4 |
+
+---
+
 ## 2025 — Session 15: Fix — Inconsistent `samplingPaused` Write in `onConnect()`
 
 ### Problem

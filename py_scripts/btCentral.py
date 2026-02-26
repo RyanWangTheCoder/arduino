@@ -490,8 +490,8 @@ async def health_task(st: RecorderState, args: argparse.Namespace) -> None:
 
 
 async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
-    cur_acc_fsr_g = 2
-    cur_gyro_fsr_dps = 250
+    cur_acc_fsr_g = 4     # matches firmware IMU_ACC_FSR_G=4 (was 2, saturated)
+    cur_gyro_fsr_dps = 1000  # matches firmware IMU_GYRO_FSR_DPS=1000 (was 250, saturated)
 
     # Cooperative scheduling: periodically yield to the event loop so writer_task/health_task
     # can run even when we are processing large EMG/IMU batches.

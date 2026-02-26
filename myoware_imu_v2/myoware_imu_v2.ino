@@ -94,8 +94,14 @@ static constexpr uint8_t TLV_IMU_BATCH = 0x02;
 static constexpr uint8_t TLV_VITALS    = 0x03;
 
 // ==================== IMU scaling config (LOGGED IN META) ====================
-static constexpr uint8_t  IMU_ACC_FSR_G     = 2;    // one of {2,4,8,16}
-static constexpr uint16_t IMU_GYRO_FSR_DPS  = 250;  // one of {250,500,1000,2000}
+// Tennis swing profile: gyro peaks ~500-1000 dps, acc peaks ~2-4g.
+// FSR=250 dps saturates on every hard swing; FSR=2g saturates on impact.
+// Raised to 1000 dps / 4g to stay in linear range while keeping resolution.
+// The FSR codes are transmitted in every IMU meta frame (FLAG_IMU_META_V2),
+// so the Python decoder (capture_loader.py) applies the correct scaling
+// automatically — no decoder changes needed when changing these values.
+static constexpr uint8_t  IMU_ACC_FSR_G     = 4;    // one of {2,4,8,16}  — was 2 (saturated)
+static constexpr uint16_t IMU_GYRO_FSR_DPS  = 1000; // one of {250,500,1000,2000} — was 250 (saturated)
 
 struct EmgSample { uint16_t env, raw; uint32_t t_us, seq; };
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };

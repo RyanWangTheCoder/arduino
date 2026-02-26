@@ -5,6 +5,23 @@ Format: newest session at the top.
 
 ---
 
+## 2026-02-25 — `btCentral.py`: IMU FSR fallback defaults raised (gyro 250→1000 dps, acc 2→4 g)
+
+### Changed (`btCentral.py`)
+- `cur_acc_fsr_g = 2` → `4` (line 493)
+- `cur_gyro_fsr_dps = 250` → `1000` (line 494)
+
+These are the **fallback defaults** used when a capture has no FSR metadata in the BLE frame
+(old firmware or missing `FLAG_IMU_META_V2`). For new captures the FSR is read from the frame
+and overrides these values automatically — no change needed to the decoder logic.
+
+### Note: `sensordata_plotter.py` — no change needed
+`--imu-thr-dps` (default 150 dps) is a physical threshold in dps. `gmag` is already in
+physical units (computed by `btCentral.py` using per-frame FSR scaling). The threshold is
+FSR-independent and remains valid at 150 dps.
+
+---
+
 ## 2026-02-25 — `sensordata_plotter.py`: Direct `fatigue_monitor` import
 
 ### Changed (`sensordata_plotter.py`)
