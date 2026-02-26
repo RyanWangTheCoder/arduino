@@ -242,8 +242,10 @@ class TimeRotatingCsv:
     def _csv_path(self) -> Path:
         return self.outdir / f"{self.base}_{self.name_prefix}_{self.open_id}_{self.idx:03d}.csv"
 
+
     def _meta_path(self) -> Path:
         return self.outdir / f"{self.base}_{self.name_prefix}_{self.open_id}_{self.idx:03d}.meta.json"
+
 
     def _write_meta(self) -> None:
         tmp = str(self._meta_path()) + ".tmp"
@@ -251,10 +253,15 @@ class TimeRotatingCsv:
             json.dump(self.meta, f, indent=2, sort_keys=True)
         os.replace(tmp, self._meta_path())
 
+
     def open(self) -> None:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.t_open = time.time()
-        self.open_id = time.strftime("%Y%m%d_%H%M%S")
+
+        # Use a timestamp with milliseconds to avoid rare collisions where a rotate happens
+        # within the same second as the previous open (which could otherwise overwrite files).
+        self.open_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int((self.t_open * 1000) % 1000):03d}"
+
         self.fp = open(self._csv_path(), "w", newline="", encoding="utf-8")
         self.w = csv.writer(self.fp)
         self.w.writerow(self.header)
@@ -263,6 +270,7 @@ class TimeRotatingCsv:
         self.meta["opened_id"] = self.open_id
         self._write_meta()
         print(f"[CSV] Logging to {self._csv_path()}")
+
 
     def rotate_if_needed(self) -> None:
         if self.fp is None:
@@ -390,10 +398,25 @@ def parse_args() -> argparse.Namespace:
 def udp_send(st: RecorderState, obj: dict) -> None:
     if st.udp_sock is None or st.udp_target is None:
         return
+
+    # Best-effort UDP: never block recording. Also add a simple backoff if sends start failing
+    # (e.g., receiver not running / network stack issues) to avoid burning CPU.
+    now = time.time()
+    next_ok = getattr(st, "udp_next_ok_ts", 0.0)
+    if now < next_ok:
+        return
+
     try:
         st.udp_sock.sendto(json.dumps(obj, separators=(",", ":")).encode("utf-8"), st.udp_target)
+        setattr(st, "udp_fail_streak", 0)
     except Exception:
-        pass
+        fail_streak = int(getattr(st, "udp_fail_streak", 0)) + 1
+        setattr(st, "udp_fail_streak", fail_streak)
+
+        # Exponential backoff up to 1s between attempts
+        backoff_s = min(1.0, 0.01 * (2 ** min(fail_streak, 7)))
+        setattr(st, "udp_next_ok_ts", now + backoff_s)
+
 
 
 async def writer_task(st: RecorderState, flush_sec: float) -> None:
@@ -470,6 +493,13 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
     cur_acc_fsr_g = 2
     cur_gyro_fsr_dps = 250
 
+    # Cooperative scheduling: periodically yield to the event loop so writer_task/health_task
+    # can run even when we are processing large EMG/IMU batches.
+    yield_every_frames = 50
+    yield_every_samples = 1000
+    frames_since_yield = 0
+    samples_since_yield = 0
+
     while True:
         first = await st.q.get()
         chunks = [first]
@@ -510,9 +540,17 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
                         if sr_hz and int(sr_hz) != int(st.last_emg_sr_hz):
                             st.last_emg_sr_hz = int(sr_hz)
                             print(f"[EMG] sr_hz={int(sr_hz)} Hz ch={int(ch)}")
-                            udp_send(st, {"k": "emg_meta", "sr_hz": int(sr_hz), "ch": int(ch),
-                                           "adc_bits": int(st.udp_adc_bits), "ymax": int(st.udp_emg_ymax),
-                                           "seg": int(st.emg_csv.idx)})
+                            udp_send(
+                                st,
+                                {
+                                    "k": "emg_meta",
+                                    "sr_hz": int(sr_hz),
+                                    "ch": int(ch),
+                                    "adc_bits": int(st.udp_adc_bits),
+                                    "ymax": int(st.udp_emg_ymax),
+                                    "seg": int(st.emg_csv.idx),
+                                },
+                            )
 
                         t0_us = dev_frame_us + int(t0_off)
                         step_us = int(round(1_000_000 / float(sr_hz))) if sr_hz else 0
@@ -532,9 +570,20 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
                             # UDP plot telemetry (decimated)
                             if st.udp_sock is not None:
                                 if ((seq0 + i) % st.emg_raw_decim) == 0:
-                                    udp_send(st, {"k": "raw", "dev_us": int(dev_us), "t": host_rx, "raw": raw, "seg": int(st.emg_csv.idx)})
+                                    udp_send(
+                                        st,
+                                        {"k": "raw", "dev_us": int(dev_us), "t": host_rx, "raw": raw, "seg": int(st.emg_csv.idx)},
+                                    )
                                 if ((seq0 + i) % st.emg_env_decim) == 0:
-                                    udp_send(st, {"k": "env", "dev_us": int(dev_us), "t": host_rx, "env": env, "seg": int(st.emg_csv.idx)})
+                                    udp_send(
+                                        st,
+                                        {"k": "env", "dev_us": int(dev_us), "t": host_rx, "env": env, "seg": int(st.emg_csv.idx)},
+                                    )
+
+                            samples_since_yield += 1
+                            if samples_since_yield >= yield_every_samples:
+                                samples_since_yield = 0
+                                await asyncio.sleep(0)
 
                     elif t == TLV_IMU_BATCH:
                         seq0, t0_off, sr_hz, count, acc_fsr_g, gyro_fsr_dps, samples = decode_imu(v, int(ver), int(flags))
@@ -555,48 +604,84 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
                             s = samples[i, :]
                             dev_us = t0_us + i * step_us
                             ax, ay, az, gx, gy, gz = [int(x) for x in s.tolist()]
-                            st.imu_rows.append([dev_us, seq0 + i, ax, ay, az, gx, gy, gz, cur_acc_fsr_g, cur_gyro_fsr_dps, int(frame_seq), host_rx])
+                            st.imu_rows.append(
+                                [
+                                    dev_us,
+                                    seq0 + i,
+                                    ax,
+                                    ay,
+                                    az,
+                                    gx,
+                                    gy,
+                                    gz,
+                                    cur_acc_fsr_g,
+                                    cur_gyro_fsr_dps,
+                                    int(frame_seq),
+                                    host_rx,
+                                ]
+                            )
 
                             if st.udp_sock is not None and ((seq0 + i) % st.imu_decim) == 0:
                                 amag = ((ax * ax + ay * ay + az * az) ** 0.5) / float(acc_lsb_per_g)
                                 gmag = ((gx * gx + gy * gy + gz * gz) ** 0.5) / float(gyro_lsb_per_dps)
-                                udp_send(st, {"k": "imu", "dev_us": int(dev_us), "t": host_rx, "amag": amag, "gmag": gmag, "seg": int(st.emg_csv.idx)})
+                                udp_send(
+                                    st,
+                                    {"k": "imu", "dev_us": int(dev_us), "t": host_rx, "amag": amag, "gmag": gmag, "seg": int(st.emg_csv.idx)},
+                                )
 
                             if is_imu_saturated(s):
                                 st.stats.imu_sat += 1
+
+                            samples_since_yield += 1
+                            if samples_since_yield >= yield_every_samples:
+                                samples_since_yield = 0
+                                await asyncio.sleep(0)
 
                     elif t == TLV_VITALS:
                         vit = decode_vitals(v)
                         age_ms = int(vit["age_ms"]) if vit["age_ms"] is not None else 65535
                         dev_computed_us = dev_frame_us - int(age_ms) * 1000
-                        
+
                         # Update cached battery values for health report
                         if vit.get("battery_pct") is not None:
                             st.last_battery_pct = int(vit["battery_pct"])
                         if vit.get("battery_v") is not None:
                             st.last_battery_v = float(vit["battery_v"])
-                        
-                                                # Send vitals to UDP plotter
+
+                        # Send vitals to UDP plotter
                         if st.udp_sock is not None:
-                            udp_send(st, {
-                                "k": "vitals",
-                                "pct": int(vit["battery_pct"]) if vit.get("battery_pct") is not None else None,
-                                "v": float(vit["battery_v"]) if vit.get("battery_v") is not None else None,
-                                "spo2": int(vit["spo2"]) if vit.get("spo2") is not None else None,
-                                "hr": float(vit["hr"]) if vit.get("hr") is not None else None,
-                                "seg": int(st.emg_csv.idx)
-                            })
-                        
-                        
-                        st.vit_w.writerow([
-                            int(dev_frame_us), int(dev_computed_us),
-                            "" if vit["spo2"] is None else f"{vit['spo2']:.0f}",
-                            "" if vit["hr"] is None else f"{vit['hr']:.1f}",
-                            int(age_ms), int(vit["flags"]), int(vit["brightness"]),
-                            "" if vit["battery_pct"] is None else int(vit["battery_pct"]),
-                            "" if vit["battery_v"] is None else f"{vit['battery_v']:.2f}",
-                            int(frame_seq), host_rx
-                        ])
+                            udp_send(
+                                st,
+                                {
+                                    "k": "vitals",
+                                    "pct": int(vit["battery_pct"]) if vit.get("battery_pct") is not None else None,
+                                    "v": float(vit["battery_v"]) if vit.get("battery_v") is not None else None,
+                                    "spo2": int(vit["spo2"]) if vit.get("spo2") is not None else None,
+                                    "hr": float(vit["hr"]) if vit.get("hr") is not None else None,
+                                    "seg": int(st.emg_csv.idx),
+                                },
+                            )
+
+                        st.vit_w.writerow(
+                            [
+                                int(dev_frame_us),
+                                int(dev_computed_us),
+                                "" if vit["spo2"] is None else f"{vit['spo2']:.0f}",
+                                "" if vit["hr"] is None else f"{vit['hr']:.1f}",
+                                int(age_ms),
+                                int(vit["flags"]),
+                                int(vit["brightness"]),
+                                "" if vit["battery_pct"] is None else int(vit["battery_pct"]),
+                                "" if vit["battery_v"] is None else f"{vit['battery_v']:.2f}",
+                                int(frame_seq),
+                                host_rx,
+                            ]
+                        )
+
+                frames_since_yield += 1
+                if frames_since_yield >= yield_every_frames:
+                    frames_since_yield = 0
+                    await asyncio.sleep(0)
 
                 now = time.time()
                 if (now - st.last_meta_write) > 10.0:
@@ -609,6 +694,7 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
 
         for _ in chunks:
             st.q.task_done()
+
 
 
 async def main() -> None:
@@ -698,10 +784,20 @@ async def main() -> None:
         try:
             st.q.put_nowait(b)
         except asyncio.QueueFull:
+            # Drop policy: drop newest chunk (this one). Recording continues.
+            # We keep counters and emit occasional warnings so data loss isn't silent.
             st.stats.queue_drops += 1
+            if (st.stats.queue_drops % 100) == 1:
+                print(
+                    f"[WARN] BLE queue full: dropped_chunks={st.stats.queue_drops} "
+                    f"qsize={st.q.qsize()}/{st.q.maxsize}. "
+                    "System may be overloaded (CPU/disk). Consider increasing --queue-max, "
+                    "reducing UDP rates, or writing logs to a faster drive."
+                )
 
     def on_notify(_: int, data: bytearray):
         loop.call_soon_threadsafe(enqueue_chunk, bytes(data))
+
 
     writer_t = asyncio.create_task(writer_task(st, args.flush_sec))
     consumer_t = asyncio.create_task(consumer_task(st, args))
@@ -840,13 +936,30 @@ async def main() -> None:
                 if "WATCHDOG_RECONNECT" not in str(e):
                     st.last_reconnect_reason = f"exception:{type(e).__name__}"
 
-                # clear queue
+                # Clear any queued BLE chunks from the previous connection attempt
                 try:
                     while not st.q.empty():
                         st.q.get_nowait()
                         st.q.task_done()
                 except Exception:
                     pass
+
+                # IMPORTANT: FrameParser is stateful (it buffers partial frames). If we reconnect
+                # mid-frame, the parser may contain stale bytes from the previous connection.
+                # Reset it so parsing restarts cleanly on the next connection.
+                st.parser = FrameParser()
+
+
+                # IMPORTANT: If the firmware resets its device clock/sequence counters on reconnect
+                # (frameSeq/emgSeq/imuSeq restart at 0, and t_us_u32 restarts), we must reset the
+                # DeviceClockExtender too. Otherwise the post-reconnect dev_us values will be
+                # "continued" from the previous session and become incorrect.
+                st.clock = DeviceClockExtender()
+
+                # Also reset frame-gap tracking so gap stats are not polluted by the reset.
+                st.last_frame_seq = None
+
+
 
                 sleep_s = min(float(args.max_backoff_sec), backoff)
                 print(f"[BLE] Reconnecting in {sleep_s:.1f}s (reason={st.last_reconnect_reason})")
