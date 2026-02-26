@@ -106,6 +106,10 @@ static volatile uint16_t emgHead = 0, emgTail = 0;
 static volatile uint16_t imuHead = 0, imuTail = 0;
 static volatile uint32_t emgSeq = 0, imuSeq = 0;
 static volatile uint32_t emgDropped = 0, imuDropped = 0;
+// Counts consecutive same-channel ADC results (ENV+ENV or RAW+RAW) —
+// indicates DMA arbiter skipped a conversion, causing a channel-order violation.
+// The overwritten value is discarded; the counter provides diagnostic visibility.
+static volatile uint32_t emgChOrderViolations = 0;
 
 // Battery state structure
 struct BatteryState {
@@ -495,9 +499,10 @@ class ServerCallbacks : public BLEServerCallbacks {
         // Reset per-session stats under their respective spinlocks —
     // emgDrainTask (Core 1) increments emgSeq/emgDropped inside emgMux,
     // imuTask (Core 1) increments imuSeq/imuDropped inside imuMux.
-    portENTER_CRITICAL(&emgMux);
-    emgDropped = 0;
-    emgSeq     = 0;
+        portENTER_CRITICAL(&emgMux);
+    emgDropped          = 0;
+    emgSeq              = 0;
+    emgChOrderViolations = 0;
     portEXIT_CRITICAL(&emgMux);
 
     portENTER_CRITICAL(&imuMux);
@@ -592,10 +597,23 @@ void emgDrainTask(void* /*param*/) {
       uint8_t  ch  = (uint8_t)((r->val >> 12) & 0x0F);
       uint16_t val = (uint16_t)(r->val & 0x0FFF);
 
-      if (ch == ADC_CH_ENV) {
+            if (ch == ADC_CH_ENV) {
+        if (envValid) {
+          // ENV arrived while previous ENV not yet paired — channel-order violation.
+          // Discard the stale ENV value; use the newer one. Count for diagnostics.
+          portENTER_CRITICAL(&emgMux);
+          emgChOrderViolations++;
+          portEXIT_CRITICAL(&emgMux);
+        }
         envVal   = val;
         envValid = true;
       } else if (ch == ADC_CH_RAW) {
+        if (rawValid) {
+          // RAW arrived while previous RAW not yet paired — channel-order violation.
+          portENTER_CRITICAL(&emgMux);
+          emgChOrderViolations++;
+          portEXIT_CRITICAL(&emgMux);
+        }
         rawVal   = val;
         rawValid = true;
       }
@@ -1358,9 +1376,10 @@ void loop() {
     // Print battery status
     printBatteryStatus();
 
-    Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
+        Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu EMGchViol=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
                   negotiatedMTU, emg_available(), imu_available(),
-                  (unsigned long)emgDropped, (unsigned long)imuDropped, (unsigned long)fps,
+                  (unsigned long)emgDropped, (unsigned long)imuDropped,
+                  (unsigned long)emgChOrderViolations, (unsigned long)fps,
                   (unsigned long)hostAge, getSamplingPaused() ? 1 : 0,
                   sSpo2.c_str(), sHr.c_str());
   }

@@ -5,7 +5,65 @@ Format: newest session at the top.
 
 ---
 
-## 2025 — Session 5: Sequence Counter Race Condition Fix
+## 2025 — Session 7: EMG Channel-Order Violation Detection
+
+### Problem
+The DMA delivers ADC results in round-robin order: ENV, RAW, ENV, RAW, ...
+If the ADC arbiter skips a conversion (e.g. due to BLE radio interference on ESP32),
+two consecutive same-channel results can arrive: ENV, ENV, RAW, RAW.
+
+The previous code silently overwrote `envVal` / `rawVal` with no record of the event.
+The resulting pair used the second ENV with the next RAW — a one-sample mismatch.
+
+### Fix
+Added `static volatile uint32_t emgChOrderViolations` counter:
+- **Incremented** inside `emgMux` spinlock when a same-channel overwrite is detected
+  (ENV arriving while `envValid` is already set, or RAW while `rawValid` is already set)
+- **Reset** to 0 under `emgMux` in `onConnect()` alongside `emgDropped` / `emgSeq`
+- **Printed** in the `[Health]` report every second as `EMGchViol=N`
+
+The pairing behaviour is unchanged — overwrite-and-continue is still correct
+(the newer value is more recent and more useful). The counter provides diagnostic
+visibility to detect ADC arbiter issues in the field.
+
+### Health Report Format Change
+```
+// Before:
+[Health] ... EMGdrop=N IMUdrop=N Frames/s=N ...
+// After:
+[Health] ... EMGdrop=N IMUdrop=N EMGchViol=N Frames/s=N ...
+```
+
+---
+
+
+
+### Problem
+`imuTask` and `spo2Task` were both priority 1 on Core 1. `spo2Task` collects 100 samples
+over ~4 seconds, calling `maxSensor.check()` in a loop with `vTaskDelay(1)` between polls.
+If `maxSensor.check()` (I2C) takes longer than expected (e.g. bus contention, timeout),
+`spo2Task` holds the CPU and `imuTask` misses its 200 Hz timer ticks — dropping IMU samples.
+
+`spo2Task` has no real-time requirement: it computes SpO2/HR once every ~30 seconds.
+`imuTask` is real-time: it must respond to 200 Hz `esp_timer` ticks within 5 ms.
+
+### Fix
+Adjusted task priorities on Core 1:
+
+| Task | Before | After | Reason |
+|---|---|---|---|
+| `emgDrainTask` | 2 | 2 | Unchanged — real-time DMA drain at 2 kHz |
+| `imuTask` | 1 | **2** | Raised — real-time 200 Hz, must not be starved |
+| `spo2Task` | 1 | **0** | Lowered — background, no real-time requirement |
+
+`emgDrainTask` and `imuTask` are now equal priority 2. The FreeRTOS scheduler
+time-slices between equal-priority tasks, so neither starves the other.
+`spo2Task` at priority 0 only runs when both priority-2 tasks are blocked
+(waiting on DMA data or `vTaskDelay`).
+
+---
+
+
 
 ### Problem
 `emgSeq`, `imuSeq`, `emgDropped`, `imuDropped` are `volatile uint32_t` accessed from two cores
