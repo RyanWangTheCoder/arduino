@@ -146,7 +146,7 @@ static bool emg_push(const EmgSample& s) {
   portENTER_CRITICAL(&emgMux);
   uint16_t next = rb_next(emgHead, EMG_BUF_SIZE);
   if (next == emgTail) { emgDropped++; ok = false; }
-  else { emgBuf[emgHead] = s; emgHead = next; }
+  else { emgBuf[emgHead] = s; emgBuf[emgHead].seq = emgSeq++; emgHead = next; }
   portEXIT_CRITICAL(&emgMux);
   return ok;
 }
@@ -156,7 +156,7 @@ static bool imu_push(const ImuSample& s) {
   portENTER_CRITICAL(&imuMux);
   uint16_t next = rb_next(imuHead, IMU_BUF_SIZE);
   if (next == imuTail) { imuDropped++; ok = false; }
-  else { imuBuf[imuHead] = s; imuHead = next; }
+  else { imuBuf[imuHead] = s; imuBuf[imuHead].seq = imuSeq++; imuHead = next; }
   portEXIT_CRITICAL(&imuMux);
   return ok;
 }
@@ -492,11 +492,18 @@ class ServerCallbacks : public BLEServerCallbacks {
     // Require FIRST host PING before sampling/streaming.
     clearHostPing();
 
-    // Reset per-session stats so drop counters are meaningful.
+        // Reset per-session stats under their respective spinlocks —
+    // emgDrainTask (Core 1) increments emgSeq/emgDropped inside emgMux,
+    // imuTask (Core 1) increments imuSeq/imuDropped inside imuMux.
+    portENTER_CRITICAL(&emgMux);
     emgDropped = 0;
+    emgSeq     = 0;
+    portEXIT_CRITICAL(&emgMux);
+
+    portENTER_CRITICAL(&imuMux);
     imuDropped = 0;
-    emgSeq = 0;
-    imuSeq = 0;
+    imuSeq     = 0;
+    portEXIT_CRITICAL(&imuMux);
 
     // Reset frame sequence used in BLE packets
     // (declared below; forward-declared here via extern)
@@ -595,14 +602,12 @@ void emgDrainTask(void* /*param*/) {
       // else: unexpected channel — ignore
 
             // Emit a paired sample once both channels have been seen
-      if (envValid && rawValid) {
+            if (envValid && rawValid) {
         EmgSample s;
-        // Back-calculate actual ADC capture time for this result slot.
-        // result[i] was the i-th conversion; result[numResults-1] is the most recent.
-        // So result[i] was captured (numResults-1-i) * US_PER_CONV µs before frame end.
         uint32_t age_us = (uint32_t)((numResults - 1u - i) * US_PER_CONV);
         s.t_us = frameEndUs - age_us;
-        s.seq  = emgSeq++;
+        // seq assigned inside emg_push() under emgMux — see emg_push_next_seq()
+        s.seq  = 0;  // placeholder; overwritten atomically in emg_push
         s.env  = envVal;
         s.raw  = rawVal;
         emg_push(s);
@@ -622,10 +627,10 @@ void imuTask(void* /*param*/) {
       bool ready = myICM.dataReady();
       if (ready) myICM.getAGMT();
       xSemaphoreGive(wireMutex);
-      if (ready) {
+            if (ready) {
         ImuSample s;
         s.t_us = micros();
-        s.seq  = imuSeq++;
+        s.seq  = 0;  // placeholder; overwritten atomically in imu_push
         s.ax   = myICM.agmt.acc.axes.x;
         s.ay   = myICM.agmt.acc.axes.y;
         s.az   = myICM.agmt.acc.axes.z;
@@ -1200,7 +1205,6 @@ void setup() {
   pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   BLEDevice::startAdvertising();
 
-      // Create ADC mutex before any task or init that uses adcHandle
     // Create mutexes before any task or init that uses the protected resources
   adcMutex  = xSemaphoreCreateMutex();
   wireMutex = xSemaphoreCreateMutex();
