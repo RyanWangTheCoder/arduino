@@ -496,9 +496,9 @@ class ServerCallbacks : public BLEServerCallbacks {
     // (declared below; forward-declared here via extern)
     // We'll reset it in loop once connected and before first send.
 
-    rb_flush_all();
+        rb_flush_all();
     imu_ticks = 0;
-        samplingPaused = true;  // direct assign OK here — BLE callback runs before tasks start
+    setSamplingPaused(true);  // atomic write — emgDrainTask on Core 1 reads this
     // ADC DMA will be started by loop() when host heartbeat arrives
   }
 

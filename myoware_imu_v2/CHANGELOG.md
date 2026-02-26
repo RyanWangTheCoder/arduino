@@ -5,7 +5,529 @@ Format: newest session at the top.
 
 ---
 
-## 2025 — Session 9: `printBatteryStatus()` — Remove Live I2C Read
+## High-Level Design Summary
+
+### System Architecture
+
+**Hardware:**
+- ESP32 WROOM-32E (dual-core Xtensa LX6, 240 MHz)
+- ICM-20948 9-axis IMU (I2C, 200 Hz)
+- MyoWare EMG sensors: ENV (envelope) + RAW (rectified) channels (ADC DMA, 2000 Hz)
+- MAX30105 pulse oximeter (I2C, 25 Hz)
+- MAX17048 battery fuel gauge (I2C)
+- BLE Nordic UART Service (NUS) for wireless data streaming
+
+**Software Stack:**
+- Arduino ESP32 core 3.3.5 (ESP-IDF 5.3.x)
+- FreeRTOS (dual-core scheduler)
+- ESP32 ADC Continuous (DMA) driver
+- Custom binary protocol with CRC16 for reliable streaming
+
+### Task Architecture (Dual-Core)
+
+**Core 0 (Protocol CPU):**
+- `loop()` — BLE TX, host watchdog, LED state machine (~1 kHz)
+- BLE stack (callbacks: `onConnect`, `onDisconnect`, `onWrite`)
+- `esp_timer` task (priority 22) — runs `imu_timer_cb` at 200 Hz
+
+**Core 1 (Sensor CPU):**
+- `emgDrainTask` (priority 2) — drains ADC DMA at 2 kHz, pairs ENV+RAW samples
+- `imuTask` (priority 2) — reads IMU at 200 Hz (timer-driven)
+- `spo2Task` (priority 0) — computes SpO2/HR every ~30 seconds (background)
+
+**Priority Rationale:**
+- Priority 2: Real-time sensor acquisition (EMG, IMU) — must not drop samples
+- Priority 0: Background computation (SpO2) — no real-time requirement
+- FreeRTOS priority inheritance prevents priority inversion on `wireMutex`
+
+### Data Flow
+
+```
+Sensors (Core 1)          Ring Buffers (shared)     BLE TX (Core 0)
+────────────────          ─────────────────────     ───────────────
+ADC DMA (2 kHz)    ──→    emgBuf[2048]       ──→   send_emg_frame()
+  ↓ emgDrainTask                                      (batched, CRC16)
+  pairs ENV+RAW
+
+ICM-20948 (200 Hz) ──→    imuBuf[512]        ──→   send_imu_frame()
+  ↓ imuTask                                           (batched, CRC16)
+  reads I2C
+
+MAX30105 (25 Hz)   ──→    vitals (atomic)    ──→   send_vitals_frame()
+  ↓ spo2Task                                          (every 30s)
+  computes SpO2/HR
+```
+
+### Synchronization Primitives
+
+**FreeRTOS Mutexes (with priority inheritance):**
+- `adcMutex` — protects `adcHandle` (ADC DMA lifecycle) across Core 0 ↔ Core 1
+- `wireMutex` — protects I2C bus (`Wire`) across `imuTask`, `spo2Task`, `loop()`
+
+**Spinlocks (`portMUX_TYPE`):**
+- `emgMux` — protects EMG ring buffer (`emgBuf`, `emgHead`, `emgTail`, `emgSeq`, `emgDropped`)
+- `imuMux` — protects IMU ring buffer (`imuBuf`, `imuHead`, `imuTail`, `imuSeq`, `imuDropped`)
+- `vitalsMux` — protects vitals state (SpO2, HR, battery)
+- `hostMux` — protects host heartbeat timestamp (`lastHostPingMs`)
+
+**Atomic Variables (GCC built-ins):**
+- `samplingPaused` — cross-core flag (Core 0 writes, Core 1 reads)
+  - Uses `__atomic_store_n` / `__atomic_load_n` with `__ATOMIC_RELEASE` / `__ATOMIC_ACQUIRE`
+  - Ensures memory barrier for cross-core visibility on Xtensa LX6
+
+**Volatile (single-writer, atomic hardware):**
+- `imu_ticks` — 32-bit counter (Core 0 `esp_timer` task writes, Core 1 `imuTask` reads/decrements)
+  - Lost ticks acceptable (just skips one IMU sample)
+- `ledBrightness` — 8-bit value (Core 1 `spo2Task` writes, Core 0 `loop` reads)
+  - Non-critical display value, 8-bit writes are atomic
+
+### Critical Timing Constraints
+
+| Task | Rate | Period | Budget | Worst-Case Blocking | Margin |
+|---|---|---|---|---|---|
+| `emgDrainTask` | 2 kHz | 500 µs | ~16 ms (DMA frame) | 10 ms (`adcMutex`) | ✅ Acceptable |
+| `imuTask` | 200 Hz | 5 ms | 5 ms | ~400 µs (`wireMutex`) | ✅ 92% margin |
+| `spo2Task` | 25 Hz | 40 ms | No deadline | N/A | ✅ Background |
+
+**Key Design Decisions:**
+1. **ADC DMA** — Hardware-clocked sampling eliminates ISR overhead and BLE radio conflicts
+2. **Timestamp back-calculation** — Corrects ~16 ms DMA latency to ~1 µs accuracy
+3. **Priority inheritance** — Prevents `spo2Task` (pri 0) from blocking `imuTask` (pri 2) indefinitely
+4. **Host watchdog** — Pauses sampling when host is absent (prevents buffer overflow)
+5. **Atomic accessors** — Ensures cross-core visibility without expensive mutexes
+
+### Tricky Parts & Gotchas
+
+**1. ADC DMA Channel-Order Violations (Session 7)**
+- **Problem:** BLE radio interference can cause ADC arbiter to skip conversions
+- **Symptom:** Two consecutive ENV or RAW results (ENV, ENV, RAW, RAW instead of ENV, RAW, ENV, RAW)
+- **Solution:** Overwrite stale value, count violations in `emgChOrderViolations` for diagnostics
+- **Why it's tricky:** Pairing logic must handle out-of-order results without dropping samples
+
+**2. Cross-Core `samplingPaused` Visibility (Session 3)**
+- **Problem:** `volatile` alone doesn't guarantee memory barrier on Xtensa LX6
+- **Symptom:** Core 1 sees stale `samplingPaused` value, continues sampling after pause
+- **Solution:** Use `__atomic_store_n` / `__atomic_load_n` with `RELEASE` / `ACQUIRE` ordering
+- **Why it's tricky:** ESP32 L1 cache is not coherent between cores for DRAM
+
+**3. `adcMutex` Held for 10 ms (Session 13)**
+- **Problem:** `emgDrainTask` holds `adcMutex` during `adc_continuous_read()` (10 ms timeout)
+- **Concern:** Does this block `emg_adc_deinit()` too long?
+- **Analysis:** All deinit call sites are non-real-time (disconnect, host timeout)
+- **Why it's tricky:** Must hold mutex across entire read to prevent use-after-free
+
+**4. Priority Inheritance on `wireMutex` (Session 13)**
+- **Problem:** `spo2Task` (pri 0) holds `wireMutex`, `imuTask` (pri 2) blocks
+- **Solution:** `xSemaphoreCreateMutex()` provides automatic priority inheritance
+- **Result:** `spo2Task` temporarily raised to pri 2 while holding mutex
+- **Why it's tricky:** Without inheritance, `emgDrainTask` (pri 2) would preempt `spo2Task`, causing unbounded delay
+
+**5. EMG Timestamp Back-Calculation (Session 4)**
+- **Problem:** `micros()` called at pair-emit time, not ADC capture time
+- **Error:** Up to 16 ms late (one full DMA frame)
+- **Solution:** Capture `frameEndUs` after `adc_continuous_read()`, back-calculate each sample's age
+- **Formula:** `actual_t_us = frameEndUs - (numResults - 1 - i) * 250 µs`
+- **Why it's tricky:** DMA delivers results in batches; must reconstruct original capture time
+
+**6. `esp_timer` Callbacks Are Tasks, Not ISRs (Session 14)**
+- **Misconception:** `esp_timer` callbacks run in hardware ISR context
+- **Reality:** `ESP_TIMER_TASK` dispatch runs callbacks in FreeRTOS task (pri 22)
+- **Implication:** Safe to use `__atomic_load_n`, `xSemaphoreTake`, etc. in `imu_timer_cb`
+- **Why it's tricky:** ESP-IDF documentation is subtle about this distinction
+
+**7. Sequence Number Assignment Under Lock (Session 5)**
+- **Problem:** `emgSeq++` was outside `emgMux`, causing race with `onConnect()` reset
+- **Solution:** Assign `seq` inside `emg_push()` under `emgMux` spinlock
+- **Pattern:** Caller sets `s.seq = 0` (placeholder), `emg_push()` overwrites with `emgSeq++`
+- **Why it's tricky:** Sequence numbers must be monotonic and gap-free for protocol correctness
+
+**8. Battery Read Caching (Session 9)**
+- **Problem:** `printBatteryStatus()` called `readBattery()` every 1 second (4 I2C transactions)
+- **Impact:** ~400 µs I2C bus time, `wireMutex` contention with real-time tasks
+- **Solution:** Cache `lastBatteryPct` / `lastBatteryVoltage`, refresh every 10 seconds
+- **Why it's tricky:** Debug prints must not impact real-time performance
+
+### Protocol Design
+
+**Frame Structure:**
+```
+[Header: 14 bytes]
+  magic0, magic1 (0xA5, 0x5A)
+  proto_ver (0x02)
+  flags (CRC16 | IMU_META_V2)
+  frame_seq (uint32_t)
+  frame_t_us (uint32_t)
+  payload_len (uint16_t)
+
+[Payload: TLV format]
+  TLV_EMG_BATCH (0x01):
+    seq, t_offset, rate, channels, count
+    [env, raw] × count
+  
+  TLV_IMU_BATCH (0x02):
+    seq, t_offset, rate, count, axes_mask
+    acc_fsr_code, gyro_fsr_code
+    [ax, ay, az, gx, gy, gz] × count
+  
+  TLV_VITALS (0x03):
+    spo2, hr_x10, age_ms, flags
+    brightness, battery_pct, battery_mv
+
+[CRC16: 2 bytes]
+  CRC-CCITT over header + payload
+```
+
+**Key Features:**
+- **Batching:** Multiple samples per frame (reduces BLE overhead)
+- **Timestamp offset:** Relative to frame timestamp (saves 4 bytes per sample)
+- **FSR metadata:** Logged in IMU frames for host-side scaling
+- **CRC16:** Detects corruption over BLE (Nordic UART is not reliable)
+
+### Host Watchdog
+
+**Policy:**
+- Host sends `PING` every ~1 second
+- Device expects PING within 2 seconds (warn)
+- Device pauses sampling after 5 seconds silence (prevents buffer overflow)
+- Device reboots after 30 seconds silence (recovers stuck BLE state)
+
+**State Machine:**
+```
+Disconnected ──connect──→ Wait Host ──PING──→ Streaming
+     ↑                         ↓                    ↓
+     └────────────────────5s timeout────────────────┘
+                              ↓
+                         30s timeout
+                              ↓
+                           Reboot
+```
+
+### LED Patterns
+
+| Mode | Pattern | Meaning |
+|---|---|---|
+| `LED_DISCONNECTED` | Slow blink (1 Hz) | No BLE connection |
+| `LED_WAIT_HOST` | Double-blink (every 2s) | Connected, waiting for host PING |
+| `LED_STREAMING` | Solid ON | Streaming data to host |
+| `LED_BACKLOG` | Fast blink (16 Hz) | Ring buffer backlog high (MTU too low) |
+| `LED_LOW_BATTERY` | Very fast blink (10 Hz) | Battery < 20% |
+
+---
+
+## 2025 — Session 15: Fix — Inconsistent `samplingPaused` Write in `onConnect()`
+
+### Problem
+The comment on line 489 in `onConnect()` was incorrect:
+```cpp
+samplingPaused = true;  // direct assign OK here — BLE callback runs before tasks start
+```
+
+**The comment is wrong because:**
+- `onConnect()` is called when a BLE client connects **AFTER** `setup()` completes
+- Tasks (`emgDrainTask`, `imuTask`, `spo2Task`) are already running at this point
+- `emgDrainTask` on Core 1 is actively reading `samplingPaused` via `getSamplingPaused()`
+
+**The inconsistency:**
+- `onDisconnect()` line 498 uses `setSamplingPaused(true)` (atomic with memory barrier)
+- `onConnect()` line 489 uses direct assign `samplingPaused = true` (no memory barrier)
+
+**Why it hasn't caused a visible bug:**
+- `onConnect()` sets `samplingPaused = true` (pausing), which is the safe direction
+- The ADC DMA hasn't been started yet (it starts only after the first PING in `loop()`)
+- `emgDrainTask` checks `getSamplingPaused()` first thing in its loop, and if true, it just sleeps for 5ms
+- So even if Core 1 sees a stale `false` value briefly, it will just do one extra iteration before seeing the updated `true`
+
+**But it's still wrong** — it violates the documented pattern and could theoretically cause a race.
+
+### Fix
+Changed `onConnect()` line 489 to use `setSamplingPaused(true)` (atomic write with memory barrier),
+matching the pattern used in `onDisconnect()` and all other cross-core writes to `samplingPaused`.
+
+```cpp
+// Before:
+samplingPaused = true;  // direct assign OK here — BLE callback runs before tasks start
+
+// After:
+setSamplingPaused(true);  // atomic write — emgDrainTask on Core 1 reads this
+```
+
+This ensures consistent use of atomic accessors for all cross-core access to `samplingPaused`.
+
+### Verification of Other Cross-Core Variables
+
+All other cross-core accesses were reviewed and confirmed correct:
+
+| Variable | Writer | Reader | Protection | Status |
+|---|---|---|---|---|
+| `samplingPaused` | Core 0 (`loop`, BLE callbacks) | Core 1 (`emgDrainTask`, `imuTask`) | `setSamplingPaused()` / `getSamplingPaused()` (atomic) | ✅ Fixed |
+| `imu_ticks` | Core 0 (`imu_timer_cb` task) | Core 1 (`imuTask`) | `volatile` + 32-bit atomic writes | ✅ Acceptable (lost ticks OK) |
+| `ledBrightness` | Core 1 (`spo2Task`) | Core 0 (`send_vitals_frame`) | 8-bit atomic reads/writes | ✅ Acceptable (non-critical display value) |
+| `lastBatteryPct` / `lastBatteryVoltage` | Core 0 (`readBattery`) | Core 0 (`printBatteryStatus`, LED check) | Same core | ✅ No issue |
+| `lastBatteryReadMs` / `batteryInitialReadDone` | Core 0 (`send_vitals_frame`) | Core 0 (`printBatteryStatus`) | Same core | ✅ No issue |
+| `isConnected` | Core 0 (BLE callbacks) | Core 0 (`loop`) | Same core | ✅ No issue |
+| `negotiatedMTU` / `maxNotifyPayload` | Core 0 (`onConnect`) | Core 0 (`loop`) | Same core | ✅ No issue |
+| `frameSeq` | Core 0 (`loop`) | Core 0 (`loop`) | Same core | ✅ No issue |
+| `emgSeq` / `imuSeq` / `emgDropped` / `imuDropped` | Core 0 (`onConnect`) / Core 1 (tasks) | Both cores | `emgMux` / `imuMux` spinlocks | ✅ Correct (Session 5) |
+| `emgChOrderViolations` | Core 1 (`emgDrainTask`) / Core 0 (`onConnect`) | Core 0 (`loop`) | `emgMux` spinlock | ✅ Correct (Session 7) |
+
+---
+
+## 2025 — Session 14: Analysis — `getSamplingPaused()` in `imu_timer_cb` (Safe from ESP32 `esp_timer` Task Context)
+
+### Concern Raised
+> `imu_timer_cb` is an `esp_timer` callback. Is it safe to call `getSamplingPaused()`
+> (which uses `__atomic_load_n`) from this context?
+
+### Analysis: Safe — `esp_timer` Callbacks Run in Task Context, Not Hardware ISR
+
+The relevant code:
+```cpp
+// Line 447-450
+static void imu_timer_cb(void* /*arg*/) {
+  if (getSamplingPaused()) return;
+  imu_ticks++;
+}
+
+static inline bool getSamplingPaused() {
+  return __atomic_load_n(&samplingPaused, __ATOMIC_ACQUIRE);
+}
+```
+
+**Key fact:** On ESP32, `esp_timer` callbacks are **not hardware ISRs**. They run in a
+dedicated FreeRTOS task (`esp_timer` task) at priority 22 (configurable). This is
+explicitly configured in `setup()` line 1210:
+
+```cpp
+esp_timer_create_args_t imuArgs = {
+  .callback = &imu_timer_cb,
+  .arg = nullptr,
+  .dispatch_method = ESP_TIMER_TASK,  // ← Runs in task context
+  .name = "imu_timer"
+};
+```
+
+The `ESP_TIMER_TASK` dispatch method guarantees the callback runs in the `esp_timer` task,
+not in a hardware interrupt. This means:
+
+1. **`__atomic_load_n` is safe** — GCC atomic built-ins are safe from any context (task or ISR)
+2. **`__ATOMIC_ACQUIRE` memory ordering is correct** — ensures cross-core visibility of
+   `samplingPaused` writes from Core 0 to reads on Core 1
+3. **`imu_ticks++` is safe** — 32-bit aligned writes are atomic on Xtensa LX6; `volatile`
+   prevents compiler reordering
+
+### What Would Be Unsafe (If This Were a Hardware ISR)
+
+If `esp_timer` callbacks were hardware ISRs (they're not), the following would be unsafe:
+
+| Operation | Safe in hardware ISR? | Safe in `esp_timer` task? |
+|---|---|---|
+| `xSemaphoreTake()` | ❌ No — would crash | ✅ Yes |
+| `portENTER_CRITICAL()` | ⚠️ Only with `_ISR` variant | ✅ Yes |
+| `__atomic_load_n()` | ✅ Yes | ✅ Yes |
+| `vTaskDelay()` | ❌ No — would crash | ✅ Yes |
+
+But since `esp_timer` callbacks run in task context, all FreeRTOS APIs are safe to use
+(within reason — long-running operations would delay other timer callbacks).
+
+### Conclusion
+No code change required. `getSamplingPaused()` is safe to call from `imu_timer_cb` because:
+
+1. `esp_timer` callbacks run in the `esp_timer` FreeRTOS task, not a hardware ISR
+2. `__atomic_load_n` is safe from any context (task or ISR)
+3. The `__ATOMIC_ACQUIRE` memory ordering ensures cross-core visibility of `samplingPaused`
+
+The current implementation is correct.
+
+---
+
+## 2025 — Session 13: Analysis — `adcMutex` Held for 10 ms During `adc_continuous_read()` (Not a Bug)
+
+### Concern Raised
+> `emgDrainTask` holds `adcMutex` for the full duration of `adc_continuous_read()`,
+> which has a 10 ms timeout. Does this block `emg_adc_deinit()` for too long?
+
+### Analysis: 10 ms Hold Is Bounded, Intentional, and Acceptable
+
+The relevant code:
+```cpp
+// emgDrainTask (Core 1)
+esp_err_t ret = adc_continuous_read(adcHandle, dmaBuf, ADC_FRAME_SIZE, &bytesRead, 10);
+xSemaphoreGive(adcMutex);  // release immediately after read
+
+// emg_adc_deinit() (Core 0)
+xSemaphoreTake(adcMutex, portMAX_DELAY);  // waits up to 10 ms
+adc_continuous_stop(adcHandle);
+adc_continuous_deinit(adcHandle);
+adcHandle = nullptr;
+xSemaphoreGive(adcMutex);
+```
+
+**Maximum blocking time for `emg_adc_deinit()`:** 10 ms (one `adc_continuous_read` timeout).
+
+**All three `emg_adc_deinit()` call sites:**
+
+| Call site | Context | 10 ms delay acceptable? |
+|---|---|---|
+| `onDisconnect()` line 509 | BLE callback, Core 0 | ✅ Yes — disconnect is not time-critical |
+| `loop()` disconnect branch line 1264 | Core 0 task | ✅ Yes — `loop()` runs at ~1 kHz, 10 ms is one iteration |
+| `loop()` host-absent branch line 1274 | Core 0 task | ✅ Yes — triggered after 5 s silence, 10 ms is negligible |
+
+None of the deinit call sites have a hard real-time deadline. A 10 ms wait is
+indistinguishable from normal `loop()` jitter in all three cases.
+
+### Why `portMAX_DELAY` in `emg_adc_deinit()` Is Correct
+Using `portMAX_DELAY` in `deinit` (rather than a timeout) is intentional:
+- `deinit` **must** complete — a partial deinit leaving `adcHandle` non-null would
+  cause `emg_adc_init()` to skip re-initialisation on the next resume.
+- The maximum wait is bounded at 10 ms by the `adc_continuous_read` timeout in
+  `emgDrainTask`, so `portMAX_DELAY` never actually waits indefinitely.
+
+### Why the Mutex Is Held Across the Full `adc_continuous_read()` Call
+Releasing the mutex before `adc_continuous_read()` returns would create a window
+where `emg_adc_deinit()` could free `adcHandle` while `adc_continuous_read()` is
+still using it — the exact crash scenario Session 2 was designed to prevent.
+The 10 ms hold is the minimum necessary to close that window.
+
+### Conclusion
+No code change required. The 10 ms mutex hold is bounded, intentional, and
+acceptable at all call sites. `portMAX_DELAY` in `deinit` is safe because the
+maximum wait is bounded by the `adc_continuous_read` timeout.
+
+---
+
+
+
+### Concern Raised
+> `spo2Task` (priority 0) holds `wireMutex` during I2C reads. `imuTask` (priority 2)
+> blocks waiting for it. Classic priority inversion — is this handled?
+
+### Analysis: FreeRTOS Priority Inheritance Covers This
+
+`wireMutex` is created with `xSemaphoreCreateMutex()` (line 1210), which is the
+FreeRTOS **mutex with priority inheritance** — not `xSemaphoreCreateBinary()` (no
+inheritance) or `xSemaphoreCreateRecursiveMutex()` (recursive, different semantics).
+
+When `imuTask` (priority 2) blocks on `wireMutex` held by `spo2Task` (priority 0),
+FreeRTOS automatically raises `spo2Task`'s effective priority to 2 for the duration
+of the lock hold. This ensures `spo2Task` is scheduled promptly to release the mutex,
+preventing `imuTask` from being indefinitely delayed by any lower-priority task.
+
+```
+Normal case (no contention):
+  spo2Task (pri 0) holds wireMutex → runs at pri 0
+  imuTask  (pri 2) not blocked     → preempts freely
+
+Priority inversion window:
+  spo2Task (pri 0) holds wireMutex
+  imuTask  (pri 2) blocks on wireMutex
+  FreeRTOS: spo2Task temporarily raised to pri 2
+  spo2Task completes I2C, releases wireMutex
+  FreeRTOS: spo2Task restored to pri 0
+  imuTask  (pri 2) acquires wireMutex, proceeds
+```
+
+### Worst-Case Blocking Time for `imuTask`
+`spo2Task` holds `wireMutex` for one I2C transaction at a time:
+- `maxSensor.check()` — one I2C read, ~100–400 µs at 400 kHz
+- `maxSensor.getRed/getIR/nextSample()` — one batch, ~200–500 µs
+- `configureMax3010x()` — multi-register write, ~500–800 µs (rare)
+
+`imuTask` budget per tick: 5 ms (200 Hz). Worst-case I2C hold ~800 µs.
+Blocking time is well within the 5 ms budget even without priority inheritance.
+
+### Why `adcMutex` Does Not Have This Issue
+`emgDrainTask` (priority 2) holds `adcMutex` only during `adc_continuous_read()`,
+which is called with a 10 ms timeout. `loop()` (Core 0) calls `emg_adc_deinit()`
+which takes `adcMutex` — but `loop()` and `emgDrainTask` are on **different cores**,
+so this is cross-core mutex contention, not priority inversion (different scheduler
+domains on ESP32 dual-core).
+
+### Conclusion
+No code change required. `xSemaphoreCreateMutex()` provides priority inheritance.
+Worst-case blocking time for `imuTask` is ~800 µs, well within the 5 ms tick budget.
+
+---
+
+
+
+### Concern Raised
+> `readBattery()` uses `if (wireMutex) xSemaphoreTake(...)` — is the conditional guard
+> necessary, and could it mask a real bug?
+
+### Analysis: Guard Is Defensive Dead-Code, Correct As-Is
+
+`readBattery()` is called from exactly **one** site:
+
+| Call site | Context | `wireMutex` state |
+|---|---|---|
+| `send_vitals_frame()` line 952 | `loop()` task, Core 0 | Always non-null (created in `setup()` before tasks start) |
+
+The two other historical call sites no longer exist:
+- `printBatteryStatus()` — rewritten in Session 9 to use cached values; no longer calls `readBattery()`
+- `setup()` initial read — calls `lipo.getSOC()` / `lipo.getVoltage()` **directly**, not through `readBattery()`
+
+The `setup()` direct calls are correct: they run before `wireMutex` is created and before
+any tasks start, so there is no contention and no mutex is needed.
+
+`readBattery()` itself is only reachable after `setup()` completes (via `loop()`), at which
+point `wireMutex` is guaranteed non-null. The `if (wireMutex)` guard is therefore
+defensive dead-code — it can never be false in practice.
+
+### Why Keep the Guard
+It costs nothing (one pointer comparison). It prevents a hard fault if `readBattery()` is
+ever called from a new code path before `setup()` completes — e.g. during future
+refactoring. It is consistent with the comment on `emg_adc_init()` which has the same
+pattern (`if (!adcMutex) return`).
+
+### Conclusion
+No code change required. The guard is correct and intentional.
+
+---
+
+
+
+### Concern Raised
+> `wireMutex` is created after `BLEDevice::startAdvertising()`. Could a BLE callback
+> fire before `wireMutex` exists and try to take it?
+
+### Analysis: Order Is Correct
+
+The `setup()` sequence is:
+```
+Wire.begin() + sensor inits     ← single-threaded, no mutex needed
+BLEDevice::init / startAdvertising  ← BLE stack starts here
+adcMutex  = xSemaphoreCreateMutex() ← created
+wireMutex = xSemaphoreCreateMutex() ← created
+configASSERT(both)              ← verified non-null
+esp_timer_create/start          ← imu_timer_cb only touches imu_ticks, no mutex
+xTaskCreatePinnedToCore × 3    ← tasks start AFTER mutexes exist
+```
+
+`BLEDevice::startAdvertising()` does start the BLE stack before the mutexes are created.
+However, the BLE callbacks that use `wireMutex` are:
+- `onConnect()` — uses `emgMux` / `imuMux` spinlocks only, **not** `wireMutex`
+- `onDisconnect()` — calls `emg_adc_deinit()`, uses `adcMutex` only
+- `onWrite()` (RxCallbacks) — uses `hostMux` spinlock only
+
+`wireMutex` is only taken in:
+- `readBattery()` — called from `send_vitals_frame()` in `loop()` (Core 0 task)
+- `imuTask` — FreeRTOS task
+- `spo2Task` — FreeRTOS task
+
+All three are FreeRTOS tasks created **after** `wireMutex` exists. No BLE callback
+ever calls `xSemaphoreTake(wireMutex, ...)`, so there is no window where a BLE
+callback could race against `wireMutex` being null.
+
+`readBattery()` has an explicit null guard: `if (wireMutex) xSemaphoreTake(...)` —
+this would safely skip the lock if somehow called before init, but that path
+does not exist in practice.
+
+### Conclusion
+No code change required. Mutex creation order is correct and safe.
+
+---
+
+
 
 ### Problem
 `printBatteryStatus()` called `readBattery()` unconditionally on every call, which is
