@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <esp_adc/adc_continuous.h>
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -47,9 +48,15 @@ static constexpr int PIN_RAW = 32; // A4 (ADC1)
 static constexpr int PIN_REF = 33; // A5 (ADC1)
 static constexpr bool REF_CONNECTED = false;
 
-// ADC attenuation (IMPORTANT for avoiding saturation & improving stability)
-// Adjust based on your actual MyoWare output swing.
-static constexpr adc_attenuation_t ADC_ATTEN = ADC_11db;
+// ADC continuous (DMA) config
+// PIN_ENV=39 → ADC1 channel 3, PIN_RAW=32 → ADC1 channel 4
+static constexpr adc_channel_t ADC_CH_ENV = ADC_CHANNEL_3;
+static constexpr adc_channel_t ADC_CH_RAW = ADC_CHANNEL_4;
+// Conversion rate: driver samples each channel in round-robin, so set
+// freq = EMG_RATE_HZ * num_channels to get EMG_RATE_HZ per channel.
+static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 conversions/s total
+static constexpr uint32_t ADC_FRAME_SIZE   = 256;               // bytes per DMA frame (must be multiple of SOC_ADC_DIGI_DATA_BYTES_PER_CONV)
+static adc_continuous_handle_t adcHandle   = nullptr;
 
 // ==================== Rates ====================
 static constexpr uint32_t EMG_RATE_HZ = 2000;
@@ -397,18 +404,57 @@ static volatile uint32_t imu_ticks = 0;
 // IMPORTANT: start paused so we don't sample/drop when no host is consuming
 static volatile bool samplingPaused = true;
 
+// ==================== ADC Continuous (DMA) helpers ====================
+
+static void emg_adc_init() {
+  if (adcHandle != nullptr) return; // already running
+
+  adc_continuous_handle_cfg_t handleCfg = {
+    .max_store_buf_size = ADC_FRAME_SIZE * 4,  // internal ring buffer
+    .conv_frame_size    = ADC_FRAME_SIZE,
+    .flags              = { .flush_pool = 0 },
+  };
+  ESP_ERROR_CHECK(adc_continuous_new_handle(&handleCfg, &adcHandle));
+
+  // Two channels: ENV and RAW, both on ADC1, 12-bit, 11dB attenuation
+  adc_digi_pattern_config_t patterns[2];
+  patterns[0].atten     = ADC_ATTEN_DB_12;  // ~0-3.3V range (replaces ADC_11db)
+  patterns[0].channel   = ADC_CH_ENV;
+  patterns[0].unit      = ADC_UNIT_1;
+  patterns[0].bit_width = ADC_BITWIDTH_12;
+
+  patterns[1].atten     = ADC_ATTEN_DB_12;
+  patterns[1].channel   = ADC_CH_RAW;
+  patterns[1].unit      = ADC_UNIT_1;
+  patterns[1].bit_width = ADC_BITWIDTH_12;
+
+  adc_continuous_config_t adcCfg = {
+    .pattern_num    = 2,
+    .adc_pattern    = patterns,
+    .sample_freq_hz = ADC_CONV_FREQ_HZ,
+    .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
+    .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2,  // includes channel tag
+  };
+  ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &adcCfg));
+  ESP_ERROR_CHECK(adc_continuous_start(adcHandle));
+  Serial.println("[ADC] Continuous DMA started.");
+}
+
+static void emg_adc_deinit() {
+  if (adcHandle == nullptr) return;
+  adc_continuous_stop(adcHandle);
+  adc_continuous_deinit(adcHandle);
+  adcHandle = nullptr;
+  Serial.println("[ADC] Continuous DMA stopped.");
+}
+
 // ==================== ADC/EMG sampling ====================
-// NOTE: For maximum stability at 2kHz, moving analogRead out of esp_timer callback is best.
-// This version keeps your structure but gates sampling based on host heartbeat.
+// emg_timer_cb is now a trivial tick counter — no ADC calls in ISR context.
+// The actual ADC reads happen in emgDrainTask via DMA.
 
 static void emg_timer_cb(void* /*arg*/) {
-  if (samplingPaused) return;
-  EmgSample s;
-  s.t_us = micros();
-  s.seq = emgSeq++;
-  s.env = analogRead(PIN_ENV);
-  s.raw = analogRead(PIN_RAW);
-  emg_push(s);
+  // intentionally empty — EMG sampling is driven by ADC continuous DMA
+  // (kept so the timer infrastructure is unchanged)
 }
 
 static void imu_timer_cb(void* /*arg*/) {
@@ -417,7 +463,7 @@ static void imu_timer_cb(void* /*arg*/) {
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* /*pServer*/) override {
+    void onConnect(BLEServer* /*pServer*/) override {
     isConnected = true;
     negotiatedMTU = BLEDevice::getMTU();
     maxNotifyPayload = (negotiatedMTU > 3) ? (negotiatedMTU - 3) : 20;
@@ -442,17 +488,81 @@ class ServerCallbacks : public BLEServerCallbacks {
     rb_flush_all();
     imu_ticks = 0;
     samplingPaused = true;
+    // ADC DMA will be started by loop() when host heartbeat arrives
   }
 
   void onDisconnect(BLEServer* /*pServer*/) override {
     isConnected = false;
     // Immediately pause sampling to avoid filling buffers while disconnected
     samplingPaused = true;
+    emg_adc_deinit();  // stop DMA while disconnected to save power
     clearHostPing();
     rb_flush_all();
     imu_ticks = 0;
   }
 };
+
+// ==================== EMG Drain Task (ADC continuous DMA) ====================
+// Runs on Core 1 alongside imuTask. Drains the DMA buffer, demultiplexes
+// ENV and RAW channels, pairs them into EmgSample, and pushes to ring buffer.
+void emgDrainTask(void* /*param*/) {
+  // Scratch buffer sized to one DMA frame
+  static uint8_t dmaBuf[ADC_FRAME_SIZE];
+
+  // Partial sample accumulator: hold one channel until the other arrives
+  bool     envValid  = false;
+  bool     rawValid  = false;
+  uint16_t envVal    = 0;
+  uint16_t rawVal    = 0;
+
+  for (;;) {
+    // Block until ADC DMA has data (10 ms timeout keeps task responsive)
+    uint32_t bytesRead = 0;
+    esp_err_t ret = adc_continuous_read(adcHandle, dmaBuf, ADC_FRAME_SIZE, &bytesRead, 10);
+
+    if (samplingPaused || adcHandle == nullptr) {
+      envValid = false;
+      rawValid = false;
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    if (ret != ESP_OK || bytesRead == 0) {
+      vTaskDelay(1);
+      continue;
+    }
+
+    uint32_t numResults = bytesRead / SOC_ADC_DIGI_RESULT_BYTES;
+    adc_digi_output_data_t* results = (adc_digi_output_data_t*)dmaBuf;
+
+    for (uint32_t i = 0; i < numResults; i++) {
+      adc_digi_output_data_t* r = &results[i];
+      uint8_t  ch  = r->type2.channel;
+      uint16_t val = r->type2.data;  // 12-bit result
+
+      if (ch == ADC_CH_ENV) {
+        envVal   = val;
+        envValid = true;
+      } else if (ch == ADC_CH_RAW) {
+        rawVal   = val;
+        rawValid = true;
+      }
+      // else: unexpected channel — ignore
+
+      // Emit a paired sample once both channels have been seen
+      if (envValid && rawValid) {
+        EmgSample s;
+        s.t_us   = micros();
+        s.seq    = emgSeq++;
+        s.env    = envVal;
+        s.raw    = rawVal;
+        emg_push(s);
+        envValid = false;
+        rawValid = false;
+      }
+    }
+  }
+}
 
 // ==================== IMU Task ====================
 void imuTask(void* /*param*/) {
@@ -920,10 +1030,13 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   led_set(false);
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(PIN_RAW, ADC_ATTEN);
-  analogSetPinAttenuation(PIN_ENV, ADC_ATTEN);
-  if (REF_CONNECTED) analogSetPinAttenuation(PIN_REF, ADC_ATTEN);
+    // ADC pins are now managed by the continuous DMA driver (emg_adc_init).
+  // analogRead / analogSetPinAttenuation are NOT used for EMG channels.
+  // PIN_REF is still available for manual reads if REF_CONNECTED is set.
+  if (REF_CONNECTED) {
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_REF, ADC_11db);
+  }
 
   Wire.begin();
   Wire.setClock(400000);
@@ -1026,20 +1139,24 @@ void setup() {
   pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   BLEDevice::startAdvertising();
 
-  // ---- Timers ----
+    // ---- Timers ----
+  // EMG timer callback is now a no-op; EMG sampling is driven by ADC DMA.
+  // Kept so the timer handle exists (harmless), but could be removed entirely.
   esp_timer_create_args_t emgArgs = { .callback = &emg_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "emg_timer" };
   esp_timer_create(&emgArgs, &emgTimer);
-  esp_timer_start_periodic(emgTimer, EMG_PERIOD_US);
+  // Note: emgTimer is NOT started here — EMG is driven by ADC DMA, not a timer tick.
 
   esp_timer_create_args_t imuArgs = { .callback = &imu_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "imu_timer" };
   esp_timer_create(&imuArgs, &imuTimer);
   esp_timer_start_periodic(imuTimer, IMU_PERIOD_US);
 
   // ---- Tasks ----
-  xTaskCreatePinnedToCore(imuTask,  "imuTask",  4096, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(spo2Task, "spo2Task", 6144, NULL, 1, NULL, 1);
+  // emgDrainTask: high priority, Core 1 (same as imuTask — both are I/O bound and short)
+  xTaskCreatePinnedToCore(emgDrainTask, "emgDrain", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(imuTask,      "imuTask",  4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(spo2Task,     "spo2Task", 6144, NULL, 1, NULL, 1);
 
-  Serial.printf("Timers started: EMG=%lu Hz, IMU=%lu Hz\n", (unsigned long)EMG_RATE_HZ, (unsigned long)IMU_RATE_HZ);
+  Serial.printf("ADC DMA: %lu Hz/ch x2 ch. IMU timer: %lu Hz\n", (unsigned long)EMG_RATE_HZ, (unsigned long)IMU_RATE_HZ);
 
   // Start paused until first host heartbeat after a BLE connection
   samplingPaused = true;
@@ -1072,26 +1189,29 @@ void loop() {
 
   // IMPORTANT: never sample when not connected
   if (!isConnected) {
-    if (!samplingPaused) {
+        if (!samplingPaused) {
       samplingPaused = true;
+      emg_adc_deinit();  // stop DMA on disconnect
       rb_flush_all();
       imu_ticks = 0;
       Serial.println("[WD] Disconnected. Pausing sampling.");
     }
   } else {
     // Connected: pause if host not alive; resume only when hostAlive
-    if (!hostAlive) {
+        if (!hostAlive) {
       if (!samplingPaused) {
         samplingPaused = true;
+        emg_adc_deinit();  // stop DMA while host is absent
         rb_flush_all();
         imu_ticks = 0;
         Serial.printf("[WD] Host heartbeat missing (%lu ms). Pausing sampling/streaming.\n", (unsigned long)hostAge);
       }
     } else {
-      if (samplingPaused) {
+            if (samplingPaused) {
         samplingPaused = false;
         rb_flush_all();
         imu_ticks = 0;
+        emg_adc_init();  // start DMA ADC now that host is alive
         Serial.println("[WD] Host heartbeat present. Resuming sampling/streaming.");
       }
     }
