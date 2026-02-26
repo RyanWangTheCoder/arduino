@@ -71,6 +71,9 @@ static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 conv/s
 // 256 bytes / sizeof(adc_digi_output_data_t=4) = 64 results per DMA frame
 static constexpr uint32_t ADC_FRAME_SIZE   = 256;
 static adc_continuous_handle_t adcHandle   = nullptr;
+// Mutex protecting adcHandle across Core 0 (loop/deinit) and Core 1 (emgDrainTask/read).
+// Must be a FreeRTOS mutex (not portMUX spinlock) because both sides are tasks, not ISRs.
+static SemaphoreHandle_t adcMutex = nullptr;
 
 // ==================== Protocol ====================
 static constexpr uint8_t MAGIC0 = 0xA5;
@@ -408,7 +411,9 @@ static volatile bool samplingPaused = true;
 // ==================== ADC Continuous (DMA) helpers ====================
 
 static void emg_adc_init() {
-  if (adcHandle != nullptr) return; // already running
+  if (!adcMutex) return;  // safety: mutex must exist before init
+  xSemaphoreTake(adcMutex, portMAX_DELAY);
+  if (adcHandle != nullptr) { xSemaphoreGive(adcMutex); return; } // already running
 
     // Zero-init first to avoid nested designated-initializer warnings in C++
   adc_continuous_handle_cfg_t handleCfg = {};
@@ -438,16 +443,20 @@ static void emg_adc_init() {
     // TYPE1 layout: bits[11:0]=12-bit data, bits[15:12]=channel index
     .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
   };
-  ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &adcCfg));
+    ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &adcCfg));
   ESP_ERROR_CHECK(adc_continuous_start(adcHandle));
+  xSemaphoreGive(adcMutex);
   Serial.println("[ADC] Continuous DMA started.");
 }
 
 static void emg_adc_deinit() {
-  if (adcHandle == nullptr) return;
+  if (!adcMutex) return;
+  xSemaphoreTake(adcMutex, portMAX_DELAY);
+  if (adcHandle == nullptr) { xSemaphoreGive(adcMutex); return; }
   adc_continuous_stop(adcHandle);
   adc_continuous_deinit(adcHandle);
   adcHandle = nullptr;
+  xSemaphoreGive(adcMutex);
   Serial.println("[ADC] Continuous DMA stopped.");
 }
 
@@ -511,8 +520,24 @@ void emgDrainTask(void* /*param*/) {
   uint16_t rawVal    = 0;
 
     for (;;) {
-    // Guard FIRST: if paused or handle not yet initialised, don't touch the driver
-    if (samplingPaused || adcHandle == nullptr) {
+        // Guard FIRST: if paused, don't touch the driver
+    if (samplingPaused) {
+      envValid = false;
+      rawValid = false;
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    // Take mutex to safely use adcHandle — prevents race with emg_adc_deinit() on Core 0
+    if (xSemaphoreTake(adcMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+      // Couldn't get mutex in time — deinit may be in progress, skip this cycle
+      vTaskDelay(1);
+      continue;
+    }
+
+    if (adcHandle == nullptr) {
+      // Handle was freed between our samplingPaused check and mutex acquisition
+      xSemaphoreGive(adcMutex);
       envValid = false;
       rawValid = false;
       vTaskDelay(5 / portTICK_PERIOD_MS);
@@ -522,6 +547,7 @@ void emgDrainTask(void* /*param*/) {
     // Block until ADC DMA has data (10 ms timeout keeps task responsive)
     uint32_t bytesRead = 0;
     esp_err_t ret = adc_continuous_read(adcHandle, dmaBuf, ADC_FRAME_SIZE, &bytesRead, 10);
+    xSemaphoreGive(adcMutex);  // release immediately after read
 
     if (ret != ESP_OK || bytesRead == 0) {
       vTaskDelay(1);
@@ -1138,7 +1164,11 @@ void setup() {
   pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   BLEDevice::startAdvertising();
 
-      // ---- Timers ----
+      // Create ADC mutex before any task or init that uses adcHandle
+  adcMutex = xSemaphoreCreateMutex();
+  configASSERT(adcMutex);  // halt if allocation failed (out of heap)
+
+  // ---- Timers ----
   // EMG is now driven by ADC DMA — no EMG timer needed.
   esp_timer_create_args_t imuArgs = { .callback = &imu_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "imu_timer" };
   esp_timer_create(&imuArgs, &imuTimer);
@@ -1221,12 +1251,11 @@ void loop() {
     // ---- Decide LED mode ----
   LedMode mode = LED_DISCONNECTED;
   
-  // Priority 1: Check for low battery first
-  if (batteryAvailable) {
-    BatteryState batt = readBattery();
-    if (batt.isValid && !isnan(batt.pct) && batt.pct < 20.0f) {
-      mode = LED_LOW_BATTERY;
-    }
+    // Priority 1: Check for low battery first.
+  // Use cached lastBatteryPct — updated every BATTERY_READ_INTERVAL_MS by send_vitals_frame().
+  // Do NOT call readBattery() here: that does I2C at ~1kHz loop rate, wasting ~100µs/call.
+  if (batteryAvailable && batteryInitialReadDone && lastBatteryPct < 20.0f) {
+    mode = LED_LOW_BATTERY;
   }
   
   // Priority 2: Other states (only if not low battery)
