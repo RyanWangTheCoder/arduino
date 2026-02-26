@@ -1,8 +1,72 @@
 # Changelog (host scripts)
 
-## Unreleased
+All notable changes to host-side scripts are documented here.
+Format: newest session at the top.
 
-### btCentral.py
+---
+
+## 2025 — Session 2: Reconnect Hygiene + Timestamp Sync Fix (btCentral.py)
+
+### Root Cause Fix: `DeviceClockExtender` Not Reset on Reconnect
+
+**Root cause location:** `btCentral.py` — host-side bug.
+
+**Problem:**
+After a BLE reconnect (or device watchdog reboot), `DeviceClockExtender` was not reset.
+The device's `micros()` counter restarts from 0 on a watchdog reboot (`ESP.restart()`).
+`DeviceClockExtender` uses a wrap-detection heuristic: if `t_us_u32` jumps backward by
+more than 2³¹ µs, it increments `wraps` and adds 2³² µs (~71 minutes) to all subsequent
+timestamps.
+
+On a device reboot, `t_us_u32` jumps from some large value (e.g., `0xC0000000`) back to
+near 0. `DeviceClockExtender` would detect this as a 32-bit wrap and add 2³² µs to all
+subsequent `dev_us` timestamps — making EMG and IMU timestamps wrong by ~71 minutes.
+
+```
+Before fix (device reboots after 30s watchdog timeout):
+  last_u32 = 0xC0000000 (device was running ~53 min)
+  new  t   = 0x00001000 (device just rebooted)
+  → (last_u32 - t) > 0x40000000 → wraps++ → WRONG
+  → dev_us = (1 << 32) + 0x00001000 ≈ 71 min + 4ms  ← incorrect
+
+After fix (DeviceClockExtender reset on reconnect):
+  wraps = 0, last_u32 = None
+  new  t   = 0x00001000
+  → dev_us = 0x00001000 = 4ms  ← correct
+```
+
+**Fix:**
+```python
+# In the reconnect exception handler:
+st.parser = FrameParser()          # clear stale partial frame bytes
+st.clock = DeviceClockExtender()   # reset extended clock — handles device reboot case
+st.last_frame_seq = None           # don't count firmware seq reset as a gap
+```
+
+**Why `FrameParser` also needs reset:**
+If the previous connection ended mid-frame, `FrameParser.buf` contains stale bytes.
+After reconnect, new data is appended to the stale bytes. The parser may attempt to
+parse a garbage frame, which will fail CRC and be counted as a `crc_errors` increment.
+Resetting the parser ensures clean parsing from the first byte of the new connection.
+
+**Why `last_frame_seq` needs reset:**
+The firmware resets `frameSeq = 0` on each new connection. Without resetting
+`last_frame_seq`, the first frame of the new connection (seq=0) would be counted as
+a gap (expected `last_seq+1`, got 0), polluting the `frame_gaps` counter.
+
+**Note on normal reconnect (no reboot):**
+On a normal BLE reconnect without device reboot, `micros()` continues monotonically —
+only `frameSeq/emgSeq/imuSeq` reset to 0. Resetting `DeviceClockExtender` in this case
+is harmless: `wraps` would be 0 anyway (no wrap has occurred yet in a typical session).
+
+**Residual limitation (by design):**
+After `DeviceClockExtender` reset, if the device has been running for more than 71 minutes
+(2³² µs) without rebooting, the extended `dev_us` values will be offset from the true
+device uptime by one wrap period. This only affects absolute timestamp values — relative
+synchronization between EMG and IMU within a session is unaffected (both use the same
+`micros()` counter). The `host_rx_ms` column provides wall-clock anchoring.
+
+### Additional Changes in This Session
 
 - **Cooperative scheduling in `consumer_task` (asyncio fairness)**
   - **Change:** Periodically yields to the event loop (`await asyncio.sleep(0)`) after processing a number of frames and also inside long EMG/IMU per-sample loops.
@@ -16,8 +80,19 @@
   - **Change:** `TimeRotatingCsv.open()` now includes milliseconds in the file `open_id`.
   - **Rationale:** Avoids rare filename collisions/overwrites when a rotation happens within the same second.
 
-- **Operational robustness / diagnostics**
-  - **BLE queue overflow warnings:** When the BLE queue is full, dropped-chunk warnings are emitted periodically (drop policy unchanged: drop newest chunk).
-  - **Reconnect hygiene:** On reconnect, resets the stateful `FrameParser` and `DeviceClockExtender` and clears frame sequence tracking.
-  - **Rationale:** Makes data loss visible, avoids stale buffered bytes after reconnect, and prevents incorrect extended device timestamps if firmware counters reset.
+- **BLE queue overflow warnings**
+  - **Change:** When the BLE queue is full, dropped-chunk warnings are emitted periodically (drop policy unchanged: drop newest chunk).
+  - **Rationale:** Makes data loss visible instead of silent.
 
+---
+
+## 2025 — Session 1: Initial btCentral.py (BLE Recorder + UDP Telemetry)
+
+- Initial implementation of robust BLE recorder with:
+  - Nordic UART Service (NUS) BLE connection to ESP32 firmware
+  - Binary protocol parser (TLV format, CRC16-CCITT, `FrameParser`)
+  - `DeviceClockExtender` for 32-bit `micros()` wrap-around handling
+  - Time-rotating CSV logging (EMG, IMU, vitals) with `.meta.json` sidecar files
+  - Host watchdog (PING/ACK keepalive, stall detection, reconnect with exponential backoff)
+  - UDP telemetry for real-time plotting (decimated RAW/ENV/IMU streams)
+  - Battery monitoring and low-battery warnings from vitals frames
