@@ -5,7 +5,78 @@ Format: newest session at the top.
 
 ---
 
-## 2025 — Session 7: EMG Channel-Order Violation Detection
+## 2025 — Session 9: `printBatteryStatus()` — Remove Live I2C Read
+
+### Problem
+`printBatteryStatus()` called `readBattery()` unconditionally on every call, which is
+invoked from the `[Health]` debug report every 1 second. `readBattery()` performs
+4 live I2C transactions (`getSOC`, `getVoltage`, `getChangeRate`, `isLow`) — ~400 µs
+of I2C bus time added to `loop()` every second, and an unnecessary contention point
+on `wireMutex` shared with `imuTask` and `spo2Task`.
+
+The cached values `lastBatteryPct` and `lastBatteryVoltage` are already maintained
+by `send_vitals_frame()` (refreshed every `BATTERY_READ_INTERVAL_MS` = 10 s) and
+by `setup()` (initial read). They are always available for a serial debug print.
+
+### Fix
+Rewritten `printBatteryStatus()` to use `lastBatteryPct` / `lastBatteryVoltage` directly.
+No I2C. No `wireMutex`. Added `age=Ns` field showing seconds since last real read,
+so the output remains honest about data freshness.
+
+```
+// Before (every 1 s):
+[Battery] 87.3% (3.92V) +0.1%/hr
+  └─ 4 live I2C reads, ~400 µs, wireMutex contention
+
+// After (every 1 s):
+[Battery] 87.3% (3.92V) age=3s
+  └─ 2 RAM reads, ~0 µs, no I2C
+```
+
+`readBattery()` is now called **only** from `send_vitals_frame()` on the 10-second interval.
+
+---
+
+
+
+### Concern Raised
+> If `emg_adc_init()` is called while `emg_adc_deinit()` hasn't set `adcHandle = nullptr` yet,
+> `adc_continuous_new_handle()` could be called while the old handle is still being deinitialized.
+
+### Analysis: Already Covered by `adcMutex` (Session 2)
+
+Both `emg_adc_init()` and `emg_adc_deinit()` take `adcMutex` with `portMAX_DELAY` as their
+first operation. The mutex serialises them completely:
+
+```
+emg_adc_deinit() (Core 0)        emg_adc_init() (Core 0)
+─────────────────────────        ───────────────────────
+xSemaphoreTake(adcMutex) LOCKED
+adc_continuous_stop()
+adc_continuous_deinit()
+adcHandle = nullptr
+xSemaphoreGive(adcMutex) UNLOCKED
+                                 xSemaphoreTake(adcMutex)  ← now acquires
+                                 adcHandle == nullptr ✓
+                                 adc_continuous_new_handle()
+                                 xSemaphoreGive(adcMutex)
+```
+
+`emg_adc_init()` cannot observe a partially-deinitialized handle because it cannot
+acquire the mutex until `emg_adc_deinit()` has completed **and** set `adcHandle = nullptr`.
+
+| Scenario | Result |
+|---|---|
+| `init` called while `deinit` holds mutex | Blocks at `xSemaphoreTake` until `deinit` finishes |
+| `init` called twice concurrently | Second caller blocks, then sees `adcHandle != nullptr` and returns |
+| `emgDrainTask` reading while `deinit` runs | 10 ms timeout — skips cycle if mutex unavailable |
+
+### Conclusion
+No code change required. The concern was valid before Session 2. `adcMutex` is the fix.
+
+---
+
+
 
 ### Problem
 The DMA delivers ADC results in round-robin order: ENV, RAW, ENV, RAW, ...

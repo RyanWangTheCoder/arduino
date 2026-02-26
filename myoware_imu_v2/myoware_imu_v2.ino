@@ -280,51 +280,33 @@ BatteryState readBattery() {
     return state;
 }
 
+// Print battery status using cached values — no I2C.
+// Cache is refreshed every BATTERY_READ_INTERVAL_MS (10 s) by send_vitals_frame().
+// Calling readBattery() here would do 4 live I2C reads every second (~400 us/call).
 void printBatteryStatus() {
     if (!batteryAvailable) {
         Serial.println("[Battery] N/A (MAX17048 not detected)");
         return;
     }
-    
-    BatteryState batt = readBattery();
-    
-    if (!batt.isValid) {
-        Serial.println("[Battery] ERROR (failed to read)");
+    if (!batteryInitialReadDone) {
+        Serial.println("[Battery] pending first read");
         return;
     }
-    
+
+    uint32_t ageMs = millis() - lastBatteryReadMs;
+
     Serial.print("[Battery] ");
-    
-    if (!isnan(batt.pct)) {
-        Serial.print(batt.pct, 1);
-        Serial.print("%");
-    } else {
-        Serial.print("?%");
-    }
-    
-    Serial.print(" (");
-    if (!isnan(batt.voltage)) {
-        Serial.print(batt.voltage, 2);
-        Serial.print("V");
-    } else {
-        Serial.print("?.??V");
-    }
-    Serial.print(")");
-    
-    if (!isnan(batt.changeRate)) {
-        if (batt.changeRate > 0) {
-            Serial.print(" ↑+");
-        } else {
-            Serial.print(" ↓");
-        }
-        Serial.print(batt.changeRate, 1);
-        Serial.print("%/hr");
-    }
-    
-    if (batt.isLow) {
+    Serial.print(lastBatteryPct, 1);
+    Serial.print("% (");
+    Serial.print(lastBatteryVoltage, 2);
+    Serial.print("V) age=");
+    Serial.print(ageMs / 1000);
+    Serial.print("s");
+
+    if (lastBatteryPct < 20.0f) {
         Serial.print(" [LOW!]");
     }
-    
+
     Serial.println();
 }
 
