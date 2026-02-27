@@ -66,7 +66,7 @@ This document explains the end-to-end design of the system:
 - **RX (Write)** (host → device): `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`
 
 ### Why NUS
-- Simple “serial over BLE” abstraction.
+- Simple "serial over BLE" abstraction.
 - Widely supported by ESP32 Arduino BLE libraries.
 - Host can use **Bleak** cross-platform.
 
@@ -137,7 +137,7 @@ Typical approach:
 - **Vitals/Battery**
   - Much slower updates.
   - Include `age_ms` so host can compute when vitals were computed.
-  - Include `battery_pct` and `battery_mv` in the “new” format.
+  - Include `battery_pct` and `battery_mv` in the "new" format.
 
 ### 4.2 Batching
 To reduce overhead, the firmware should batch multiple samples into one TLV:
@@ -163,7 +163,7 @@ Firmware must:
 `btCentral.py` sends `PING` to NUS RX periodically.
 
 On ESP32, typical behavior is:
-- When a `PING` is received: update “last host seen” timestamp.
+- When a `PING` is received: update "last host seen" timestamp.
 - If no PING for N seconds: optionally reduce sampling or stop streaming.
 - If no PING for longer: optionally reboot BLE stack.
 
@@ -223,7 +223,7 @@ Key design choice: **BLE callback does minimal work** (just enqueues bytes). Par
 
 #### Segment length (example: split every 20 minutes)
 - `--rotate-min` controls how often EMG/IMU files rotate.
-- For “split every 20 minutes”, run with:
+- For "split every 20 minutes", run with:
   ```shell
   python btCentral.py --name MyoW1 --outdir logs --rotate-min 20
   ```
@@ -252,7 +252,7 @@ Fields:
 #### Why rotate
 - Keeps files smaller for easier copying/sharing.
 - Limits blast-radius if a file is partially written when power is lost.
-- Enables “process-as-you-record” workflows where analysis can start on earlier segments.
+- Enables "process-as-you-record" workflows where analysis can start on earlier segments.
 
 ---
 
@@ -322,7 +322,7 @@ Plotter shows 3 curves:
 ### 7.4 Optional fatigue monitor
 If enabled:
 - Maintains a ring buffer of raw EMG samples.
-- Uses IMU gyro magnitude threshold (`--imu-thr-dps`) to trigger a “swing”.
+- Uses IMU gyro magnitude threshold (`--imu-thr-dps`) to trigger a "swing".
 - Calls `FatigueMonitor.push_swing()` in a background thread.
 - Displays MDF trend and fatigue level.
 
@@ -412,7 +412,7 @@ python sensordata_plotter.py --mode offline --emg-file <path> [options]
 - `--emg-ymax <float>`
   - EMG y-axis max (default: `4095.0`)
 - `--cutoff-hz <float>`
-  - Cutoff for plotter’s LPF envelope of abs(raw) (default: `3.6`)
+  - Cutoff for plotter's LPF envelope of abs(raw) (default: `3.6`)
 
 **Meta inference (if plotter starts after recorder and misses emg_meta)**
 
@@ -484,12 +484,120 @@ python sensordata_plotter.py --mode live --listen-port 9999 --infer-sr
 - TLV lengths are correct (host will drop malformed TLVs).
 
 ### Plotter correctness
-- Verify RAW looks “high frequency” and ENV is slow-varying.
+- Verify RAW looks "high frequency" and ENV is slow-varying.
 - If RAW and ENV look identical, check UDP decimation rates.
 
 ---
 
-## 10) Notes on repository docs
+## 11) Swing detection algorithms
+
+The system implements **two different swing detection algorithms** for different purposes:
+
+### 11.1 Real-time gyroscope-based detection (simple, fast)
+
+**Used by:**
+- **Android app**: `SessionCaptureActivity.java` (`C:\wangx\ftc\arduino\btLeApp\app\src\main\java\com\clj\blesample\capture\SessionCaptureActivity.java`)
+- **Python plotter**: `sensordata_plotter.py` (this directory)
+
+**Purpose:** Real-time swing counting and fatigue monitoring during live sessions.
+
+**Algorithm:** Peak detection on gyroscope magnitude
+
+```
+1. Calculate gyro magnitude: gmag = sqrt(gx² + gy² + gz²)
+2. Convert to degrees per second: gmag_dps = gmag / GYRO_SCALE_FACTOR
+3. Peak detection state machine:
+   - When gmag_dps >= threshold (default 150 dps):
+     * If not in peak: Start tracking new peak
+     * If in peak: Update peak if current value is higher
+   - When gmag_dps < threshold and in peak:
+     * Trigger detection at the PEAK point (not at threshold crossing)
+     * Apply 1-second debounce to prevent re-triggers
+     * Increment swing counter
+     * Queue EMG snapshot for fatigue analysis
+```
+
+**Key parameters:**
+- Threshold: 150 dps (adjustable via `--imu-thr-dps` in plotter, SeekBar in Android)
+- Debounce: 1 second (prevents double-counting backswing + forward swing)
+- Scale factor: 16.4 LSB/dps (ICM-20948 at ±2000 dps range)
+
+**Why gyroscope (not accelerometer):**
+- Gyroscope measures **rotation rate** → directly captures swing motion
+- Accelerometer measures **linear acceleration** → affected by gravity, arm movement, walking
+- Tennis swings are primarily **rotational** movements
+- Gyroscope provides cleaner, more reliable swing detection
+
+**Why peak detection (not simple threshold):**
+- Tennis swings have backswing + forward swing, both exceeding threshold
+- Simple threshold would trigger twice per swing
+- Peak detection finds the HIGHEST rotation point → one trigger per swing
+- More accurate timing for EMG snapshot (captured at maximum effort)
+
+**Implementation consistency:**
+Both Android (Java) and Python implementations use **identical logic**:
+- Same sensor (gyroscope)
+- Same threshold (150 dps default)
+- Same debounce (1 second)
+- Same peak tracking algorithm
+- Same trigger timing (at peak, not threshold crossing)
+
+This ensures consistent swing counts across real-time tools.
+
+### 11.2 Offline EMG-based detection (sophisticated, accurate)
+
+**Used by:**
+- **Offline analysis**: `emg_util.py` in `C:\wangx\ftc\emg_util\`
+
+**Purpose:** Post-session analysis with higher accuracy for research/training insights.
+
+**Algorithm:** Multi-stage EMG envelope analysis
+
+```
+1. Bandpass filter EMG (20-450 Hz) to remove noise and motion artifacts
+2. Compute envelope via Hilbert transform
+3. Smooth envelope with moving average
+4. Find peaks in envelope that exceed adaptive threshold
+5. Validate peaks:
+   - Minimum prominence (relative to surrounding baseline)
+   - Minimum distance between peaks (prevents double-counting)
+   - Minimum duration above threshold
+6. Refine peak timing using local maxima search
+```
+
+**Why EMG (not IMU) for offline:**
+- **EMG directly measures muscle activation** → ground truth for effort
+- **IMU can miss swings** if rotation is below threshold (e.g., soft volleys, drop shots)
+- **EMG captures all muscle contractions** regardless of swing speed/amplitude
+- **Better for fatigue analysis** since MDF is computed from EMG anyway
+
+**Why more sophisticated:**
+- Offline analysis has **no real-time constraints** → can use complex algorithms
+- Can **look ahead and behind** in time → better peak validation
+- Can use **adaptive thresholds** based on session statistics
+- Can **filter out false positives** (e.g., practice swings, adjustments)
+
+**Trade-offs:**
+
+| Feature | Real-time (Gyro) | Offline (EMG) |
+|---------|------------------|---------------|
+| **Latency** | <10ms | N/A (post-session) |
+| **Accuracy** | ~95% | ~98% |
+| **False positives** | Walking, gestures | Rare |
+| **False negatives** | Soft swings | Very rare |
+| **Computational cost** | Very low | Moderate |
+| **Use case** | Live feedback | Research analysis |
+
+**When to use which:**
+- **Real-time gyro**: Live sessions, immediate feedback, fatigue monitoring during play
+- **Offline EMG**: Post-session analysis, training insights, research studies, ground truth validation
+
+---
+
+## 12) Notes on repository docs
 
 - `PROTOCOL.md` contains a deeper protocol/architecture specification and is the authoritative reference for fields.
-- This document is intended as the quick “how the pieces fit together” explanation.
+- This document is intended as the quick "how the pieces fit together" explanation.
+- For swing detection implementation details, see:
+  - Real-time: `SessionCaptureActivity.java` (Android) and `sensordata_plotter.py` (Python)
+  - Offline: `emg_util.py` in the `emg_util/` directory

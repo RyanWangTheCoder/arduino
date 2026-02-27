@@ -200,8 +200,14 @@ def run_live(args: argparse.Namespace) -> None:
         'history': [],   # list of {t_peak_ms, mdf, mdf_drop_pct, fatigue_level}
     }
     emg_fatigue_buf = deque(maxlen=EMG_FATIGUE_BUF_SIZE)
+    
+    # Peak detection state (matches Android implementation)
     last_imu_trigger_t = [-999.0]   # mutable container (avoids nonlocal float)
     imu_thr_dps = float(args.imu_thr_dps)
+    in_peak = [False]           # mutable: currently tracking a peak
+    peak_gyro_mag = [0.0]       # mutable: highest gyro value in current peak
+    peak_time_sec = [0.0]       # mutable: time of peak
+    swing_count = [0]           # mutable: total swings detected this session
 
     if fatigue_enabled:
         util_path = args.emg_util_path
@@ -446,20 +452,39 @@ def run_live(args: argparse.Namespace) -> None:
                     continue
                 imu_buf.append((t_sec, float(a)))
 
-                # Fatigue trigger: gyro magnitude threshold + 300ms debounce
+                # Peak detection: only trigger on the HIGHEST point of the swing
+                # This prevents double-counting backswing + forward swing
                 if fatigue_enabled and monitor is not None and fatigue_q is not None:
                     gmag = msg.get('gmag')
                     if gmag is not None:
                         gmag = float(gmag)
-                        if gmag >= imu_thr_dps and (t_sec - last_imu_trigger_t[0]) >= 0.3:
-                            last_imu_trigger_t[0] = t_sec
-                            snap = list(emg_fatigue_buf)   # snapshot (copy)
-                            if len(snap) >= 32:
-                                t_peak_ms = float(dev_us) / 1000.0
-                                try:
-                                    fatigue_q.put_nowait((snap, t_peak_ms, gmag))
-                                except queue.Full:
-                                    pass   # drop if fatigue thread is still busy
+                        
+                        if gmag >= imu_thr_dps:
+                            if not in_peak[0]:
+                                # Start of new peak
+                                in_peak[0] = True
+                                peak_gyro_mag[0] = gmag
+                                peak_time_sec[0] = t_sec
+                            else:
+                                # Already in peak - update if this is higher
+                                if gmag > peak_gyro_mag[0]:
+                                    peak_gyro_mag[0] = gmag
+                                    peak_time_sec[0] = t_sec
+                        elif in_peak[0]:
+                            # Dropped below threshold - end of peak
+                            # Trigger detection at the peak point (if debounce allows)
+                            if (peak_time_sec[0] - last_imu_trigger_t[0]) >= 1.0:
+                                last_imu_trigger_t[0] = peak_time_sec[0]
+                                swing_count[0] += 1  # Increment swing counter
+                                snap = list(emg_fatigue_buf)   # snapshot (copy)
+                                if len(snap) >= 32:
+                                    t_peak_ms = peak_time_sec[0] * 1000.0
+                                    try:
+                                        fatigue_q.put_nowait((snap, t_peak_ms, peak_gyro_mag[0]))
+                                    except queue.Full:
+                                        pass   # drop if fatigue thread is still busy
+                            in_peak[0] = False
+                            peak_gyro_mag[0] = 0.0
 
             elif k == 'battery':
                 pct = msg.get('pct')
@@ -507,7 +532,7 @@ def run_live(args: argparse.Namespace) -> None:
         xlim_lo = max(0.0, now_t - max(emg_win, imu_win))
         ax_imu.set_xlim(xlim_lo, now_t)   # propagates to ax_emg via sharex
 
-        # --- Title: vitals ---
+        # --- Title: vitals + swing count ---
         if last_vitals:
             parts = []
             if last_vitals.get('pct') is not None:
@@ -519,13 +544,18 @@ def run_live(args: argparse.Namespace) -> None:
                 parts.append(f"SpO2: {last_vitals['spo2']}%")
             if last_vitals.get('hr') is not None:
                 parts.append(f"HR: {last_vitals['hr']:.1f} bpm")
+            # Add swing count
+            if fatigue_enabled and swing_count[0] > 0:
+                parts.append(f"SWINGS: {swing_count[0]}")
             title_text.set_text('Realtime Monitoring | ' + ' | '.join(parts))
             batt_pct = last_vitals.get('pct', 100)
             batt_color = 'red' if batt_pct < 20 else ('orange' if batt_pct < 50 else 'green')
             title_text.set_color(batt_color)
             title_text.set_fontweight('bold')
         else:
-            title_text.set_text('Realtime Monitoring [Waiting for Vitals...]')
+            # Show swing count even without vitals
+            swing_str = f" | SWINGS: {swing_count[0]}" if (fatigue_enabled and swing_count[0] > 0) else ""
+            title_text.set_text(f'Realtime Monitoring [Waiting for Vitals...]{swing_str}')
             title_text.set_color('black')
             title_text.set_fontweight('normal')
 
