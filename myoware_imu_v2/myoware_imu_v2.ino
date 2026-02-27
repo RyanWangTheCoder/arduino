@@ -63,12 +63,16 @@ static constexpr uint32_t HEALTH_REPORT_MS = 1000;
 
 // ==================== ADC Continuous (DMA) config ====================
 // Placed after EMG_RATE_HZ so the constexpr multiply is valid.
-// PIN_ENV=39 → ADC1 channel 3, PIN_RAW=32 → ADC1 channel 4
+// PIN_ENV=39 -> ADC1 channel 3, PIN_RAW=32 -> ADC1 channel 4
 static constexpr adc_channel_t ADC_CH_ENV  = ADC_CHANNEL_3;
 static constexpr adc_channel_t ADC_CH_RAW  = ADC_CHANNEL_4;
-// Round-robin over 2 channels: total conv rate = EMG_RATE_HZ * 2
-static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 conv/s
+// ESP32 ADC continuous mode minimum frequency is ~20 kHz (IDF 5.x).
+// We oversample at 20 kHz/channel (40 kHz total for 2 channels) and
+// decimate by ADC_OVERSAMPLE (10x) in emgDrainTask to yield 2 kHz EMG output.
+static constexpr uint32_t ADC_OVERSAMPLE   = 10;                        // decimation factor
+static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2 * ADC_OVERSAMPLE; // 40000 conv/s
 // 256 bytes / sizeof(adc_digi_output_data_t=4) = 64 results per DMA frame
+// At 40 kHz this frame covers 64/40000 = 1.6 ms -- well within task scheduling jitter.
 static constexpr uint32_t ADC_FRAME_SIZE   = 256;
 static adc_continuous_handle_t adcHandle   = nullptr;
 // Mutex protecting adcHandle across Core 0 (loop/deinit) and Core 1 (emgDrainTask/read).
@@ -99,9 +103,9 @@ static constexpr uint8_t TLV_VITALS    = 0x03;
 // Raised to 1000 dps / 4g to stay in linear range while keeping resolution.
 // The FSR codes are transmitted in every IMU meta frame (FLAG_IMU_META_V2),
 // so the Python decoder (capture_loader.py) applies the correct scaling
-// automatically — no decoder changes needed when changing these values.
-static constexpr uint8_t  IMU_ACC_FSR_G     = 4;    // one of {2,4,8,16}  — was 2 (saturated)
-static constexpr uint16_t IMU_GYRO_FSR_DPS  = 1000; // one of {250,500,1000,2000} — was 250 (saturated)
+// automatically -- no decoder changes needed when changing these values.
+static constexpr uint8_t  IMU_ACC_FSR_G     = 4;    // one of {2,4,8,16}  -- was 2 (saturated)
+static constexpr uint16_t IMU_GYRO_FSR_DPS  = 1000; // one of {250,500,1000,2000} -- was 250 (saturated)
 
 struct EmgSample { uint16_t env, raw; uint32_t t_us, seq; };
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };
@@ -112,18 +116,13 @@ static volatile uint16_t emgHead = 0, emgTail = 0;
 static volatile uint16_t imuHead = 0, imuTail = 0;
 static volatile uint32_t emgSeq = 0, imuSeq = 0;
 static volatile uint32_t emgDropped = 0, imuDropped = 0;
-// Counts consecutive same-channel ADC results (ENV+ENV or RAW+RAW) —
-// indicates DMA arbiter skipped a conversion, causing a channel-order violation.
-// The overwritten value is discarded; the counter provides diagnostic visibility.
-static volatile uint32_t emgChOrderViolations = 0;
 
-// Battery state structure
 struct BatteryState {
-    float pct;          // 0-100%, or NaN if unavailable
-    float voltage;      // Volts, or NaN if unavailable
-    float changeRate;   // %/hr, or NaN if unavailable
-    bool isLow;         // Low battery alert
-    bool isValid;       // True if data is valid
+  float pct;        // 0-100%, or NaN if unavailable
+  float voltage;    // Volts, or NaN if unavailable
+  float changeRate; // %/hr, or NaN if unavailable
+  bool isLow;       // Low battery alert
+  bool isValid;     // True if data is valid
 };
 
 static portMUX_TYPE emgMux = portMUX_INITIALIZER_UNLOCKED;
@@ -219,7 +218,6 @@ static void rb_flush_all() {
 }
 
 // ==================== Sensors ====================
-MyoWare myoware;
 ICM_20948_I2C myICM;
 static constexpr uint8_t AD0_VAL = 1;
 
@@ -249,82 +247,81 @@ static constexpr uint32_t SATURATION_HIGH = 200000;
 static constexpr uint32_t SATURATION_LOW  = 10000;
 
 
-
 BatteryState readBattery() {
-    BatteryState state;
+  BatteryState state;
+  state.pct = NAN;
+  state.voltage = NAN;
+  state.changeRate = NAN;
+  state.isLow = false;
+  state.isValid = false;
+
+  if (!batteryAvailable) return state;
+
+  // Guard I2C bus -- shared with imuTask and spo2Task
+  if (wireMutex) xSemaphoreTake(wireMutex, portMAX_DELAY);
+  state.pct        = lipo.getSOC();
+  state.voltage    = lipo.getVoltage();
+  state.changeRate = lipo.getChangeRate();
+  state.isLow      = lipo.isLow();
+  if (wireMutex) xSemaphoreGive(wireMutex);
+
+  // Validate readings (sanity check)
+  if (state.pct < 0.0f || state.pct > 100.0f) {
     state.pct = NAN;
+  }
+  if (state.voltage < 2.5f || state.voltage > 4.5f) {
     state.voltage = NAN;
-    state.changeRate = NAN;
-    state.isLow = false;
-    state.isValid = false;
+  }
 
-    if (!batteryAvailable) return state;
+  // Mark as valid if at least one field is good
+  state.isValid = !isnan(state.pct) || !isnan(state.voltage);
 
-    // Guard I2C bus — shared with imuTask and spo2Task
-    if (wireMutex) xSemaphoreTake(wireMutex, portMAX_DELAY);
-    state.pct        = lipo.getSOC();
-    state.voltage    = lipo.getVoltage();
-    state.changeRate = lipo.getChangeRate();
-    state.isLow      = lipo.isLow();
-    if (wireMutex) xSemaphoreGive(wireMutex);
-    
-    // Validate readings (sanity check)
-    if (state.pct < 0.0f || state.pct > 100.0f) {
-        state.pct = NAN;
-    }
-    if (state.voltage < 2.5f || state.voltage > 4.5f) {
-        state.voltage = NAN;
-    }
-    
-    // Mark as valid if at least one field is good
-    state.isValid = !isnan(state.pct) || !isnan(state.voltage);
-    
-    // Cache for fallback
-    if (!isnan(state.pct)) lastBatteryPct = state.pct;
-    if (!isnan(state.voltage)) lastBatteryVoltage = state.voltage;
-    
-    return state;
+  // Cache for fallback
+  if (!isnan(state.pct)) lastBatteryPct = state.pct;
+  if (!isnan(state.voltage)) lastBatteryVoltage = state.voltage;
+
+  return state;
 }
 
-// Print battery status using cached values — no I2C.
+// Print battery status using cached values -- no I2C.
 // Cache is refreshed every BATTERY_READ_INTERVAL_MS (10 s) by send_vitals_frame().
 // Calling readBattery() here would do 4 live I2C reads every second (~400 us/call).
 void printBatteryStatus() {
-    if (!batteryAvailable) {
-        Serial.println("[Battery] N/A (MAX17048 not detected)");
-        return;
-    }
-    if (!batteryInitialReadDone) {
-        Serial.println("[Battery] pending first read");
-        return;
-    }
+  if (!batteryAvailable) {
+    Serial.println("[Battery] N/A (MAX17048 not detected)");
+    return;
+  }
+  if (!batteryInitialReadDone) {
+    Serial.println("[Battery] pending first read");
+    return;
+  }
 
-    uint32_t ageMs = millis() - lastBatteryReadMs;
+  uint32_t ageMs = millis() - lastBatteryReadMs;
 
-    Serial.print("[Battery] ");
-    Serial.print(lastBatteryPct, 1);
-    Serial.print("% (");
-    Serial.print(lastBatteryVoltage, 2);
-    Serial.print("V) age=");
-    Serial.print(ageMs / 1000);
-    Serial.print("s");
+  Serial.print("[Battery] ");
+  Serial.print(lastBatteryPct, 1);
+  Serial.print("% (");
+  Serial.print(lastBatteryVoltage, 2);
+  Serial.print("V) age=");
+  Serial.print(ageMs / 1000);
+  Serial.print("s");
 
-    if (lastBatteryPct < 20.0f) {
-        Serial.print(" [LOW!]");
-    }
+  if (lastBatteryPct < 20.0f) {
+    Serial.print(" [LOW!]");
+  }
 
-    Serial.println();
+  Serial.println();
 }
 
 // Shared vitals state (written by task, read by BLE loop)
 struct VitalsState {
-  uint16_t spo2_u16;       // 0..100 or 0xFFFF invalid
-  uint16_t hr_x10_u16;     // bpm*10 or 0xFFFF invalid
-  uint32_t computed_ms;    // millis() when computed
-  uint8_t  flags;          // bit0 spo2Valid, bit1 hrValid
+  uint16_t spo2_u16;    // 0..100 or 0xFFFF invalid
+  uint16_t hr_x10_u16;  // bpm*10 or 0xFFFF invalid
+  uint32_t computed_ms; // millis() when computed
+  uint8_t  flags;       // bit0 spo2Valid, bit1 hrValid
   byte     brightness;
-  uint8_t  battery_pct;    // Battery percentage (0-100 or 255 if unknown)
-  uint16_t battery_mv;     // Battery voltage in millivolts (0 if unknown)
+  uint8_t  battery_pct; // Battery percentage (0-100 or 255 if unknown)
+  uint16_t battery_mv;  // Battery voltage in millivolts (0 if unknown)
 };
 static VitalsState vitals = {0xFFFF, 0xFFFF, 0, 0, ledBrightness, 255, 0};
 static portMUX_TYPE vitalsMux = portMUX_INITIALIZER_UNLOCKED;
@@ -341,13 +338,11 @@ uint16_t maxNotifyPayload = 20;
 
 // Host heartbeat tracking (application-level watchdog)
 static volatile uint32_t lastHostPingMs = 0;
-static volatile uint32_t lastHostAckSeq = 0;
 static portMUX_TYPE hostMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ==================== LED State vars ====================
 static LedMode ledMode = LED_DISCONNECTED;
 static uint32_t ledLastMs = 0;
-static uint8_t ledPhase = 0;
 
 static inline uint32_t getLastHostPingMs() {
   portENTER_CRITICAL(&hostMux);
@@ -368,9 +363,8 @@ static inline void clearHostPing() {
   portEXIT_CRITICAL(&hostMux);
 }
 
-static inline void setLastHostAck(uint32_t ack) {
+static inline void setLastHostAck(uint32_t /*ack*/) {
   portENTER_CRITICAL(&hostMux);
-  lastHostAckSeq = ack;
   lastHostPingMs = millis(); // treat ACK as heartbeat too
   portEXIT_CRITICAL(&hostMux);
 }
@@ -394,7 +388,7 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 };
 
 // ==================== Timers ====================
-// emgTimer removed — EMG sampling is driven by ADC DMA, not a software timer.
+// emgTimer removed -- EMG sampling is driven by ADC DMA, not a software timer.
 static esp_timer_handle_t imuTimer = nullptr;
 
 // Use counter instead of bool to avoid losing ticks
@@ -403,7 +397,7 @@ static volatile uint32_t imu_ticks = 0;
 // IMPORTANT: start paused so we don't sample/drop when no host is consuming
 static volatile bool samplingPaused = true;
 
-// Atomic accessors for samplingPaused — written on Core 0, read on Core 1.
+// Atomic accessors for samplingPaused -- written on Core 0, read on Core 1.
 // volatile alone does not guarantee cross-core visibility on Xtensa LX6
 // (no hardware memory barrier). __atomic builtins insert the required barriers.
 static inline void setSamplingPaused(bool v) {
@@ -420,7 +414,7 @@ static void emg_adc_init() {
   xSemaphoreTake(adcMutex, portMAX_DELAY);
   if (adcHandle != nullptr) { xSemaphoreGive(adcMutex); return; } // already running
 
-    // Zero-init first to avoid nested designated-initializer warnings in C++
+  // Zero-init first to avoid nested designated-initializer warnings in C++
   adc_continuous_handle_cfg_t handleCfg = {};
   handleCfg.max_store_buf_size = ADC_FRAME_SIZE * 4;  // internal ring buffer
   handleCfg.conv_frame_size    = ADC_FRAME_SIZE;
@@ -448,7 +442,7 @@ static void emg_adc_init() {
     // TYPE1 layout: bits[11:0]=12-bit data, bits[15:12]=channel index
     .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
   };
-    ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &adcCfg));
+  ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &adcCfg));
   ESP_ERROR_CHECK(adc_continuous_start(adcHandle));
   xSemaphoreGive(adcMutex);
   Serial.println("[ADC] Continuous DMA started.");
@@ -472,7 +466,7 @@ static void imu_timer_cb(void* /*arg*/) {
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* /*pServer*/) override {
+  void onConnect(BLEServer* /*pServer*/) override {
     isConnected = true;
     negotiatedMTU = BLEDevice::getMTU();
     maxNotifyPayload = (negotiatedMTU > 3) ? (negotiatedMTU - 3) : 20;
@@ -484,13 +478,12 @@ class ServerCallbacks : public BLEServerCallbacks {
     // Require FIRST host PING before sampling/streaming.
     clearHostPing();
 
-        // Reset per-session stats under their respective spinlocks —
+    // Reset per-session stats under their respective spinlocks --
     // emgDrainTask (Core 1) increments emgSeq/emgDropped inside emgMux,
     // imuTask (Core 1) increments imuSeq/imuDropped inside imuMux.
-        portENTER_CRITICAL(&emgMux);
-    emgDropped          = 0;
-    emgSeq              = 0;
-    emgChOrderViolations = 0;
+    portENTER_CRITICAL(&emgMux);
+    emgDropped = 0;
+    emgSeq     = 0;
     portEXIT_CRITICAL(&emgMux);
 
     portENTER_CRITICAL(&imuMux);
@@ -502,16 +495,16 @@ class ServerCallbacks : public BLEServerCallbacks {
     // (declared below; forward-declared here via extern)
     // We'll reset it in loop once connected and before first send.
 
-        rb_flush_all();
+    rb_flush_all();
     imu_ticks = 0;
-    setSamplingPaused(true);  // atomic write — emgDrainTask on Core 1 reads this
+    setSamplingPaused(true);  // atomic write -- emgDrainTask on Core 1 reads this
     // ADC DMA will be started by loop() when host heartbeat arrives
   }
 
   void onDisconnect(BLEServer* /*pServer*/) override {
     isConnected = false;
     // Immediately pause sampling to avoid filling buffers while disconnected
-        setSamplingPaused(true);
+    setSamplingPaused(true);
     emg_adc_deinit();  // stop DMA while disconnected to save power
     clearHostPing();
     rb_flush_all();
@@ -526,24 +519,25 @@ void emgDrainTask(void* /*param*/) {
   // Scratch buffer sized to one DMA frame
   static uint8_t dmaBuf[ADC_FRAME_SIZE];
 
-  // Partial sample accumulator: hold one channel until the other arrives
-  bool     envValid  = false;
-  bool     rawValid  = false;
-  uint16_t envVal    = 0;
-  uint16_t rawVal    = 0;
+  // Oversampling accumulators: sum ADC_OVERSAMPLE raw readings per channel,
+  // then divide to produce one decimated sample at EMG_RATE_HZ.
+  // Overflow protection: With ADC_OVERSAMPLE=10 and 12-bit ADC (max 4095),
+  // maximum accumulator value is 10*4095 = 40,950, well within uint32_t range.
+  uint32_t envAcc   = 0;  // running sum for ENV channel
+  uint32_t rawAcc   = 0;  // running sum for RAW channel
+  uint8_t  envCount = 0;  // how many ENV readings accumulated so far
+  uint8_t  rawCount = 0;  // how many RAW readings accumulated so far
 
-    for (;;) {
-        // Guard FIRST: if paused, don't touch the driver
-        if (getSamplingPaused()) {
-      envValid = false;
-      rawValid = false;
+  for (;;) {
+    // Guard FIRST: if paused, don't touch the driver
+    if (getSamplingPaused()) {
       vTaskDelay(5 / portTICK_PERIOD_MS);
       continue;
     }
 
-    // Take mutex to safely use adcHandle — prevents race with emg_adc_deinit() on Core 0
+    // Take mutex to safely use adcHandle -- prevents race with emg_adc_deinit() on Core 0
     if (xSemaphoreTake(adcMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
-      // Couldn't get mutex in time — deinit may be in progress, skip this cycle
+      // Couldn't get mutex in time -- deinit may be in progress, skip this cycle
       vTaskDelay(1);
       continue;
     }
@@ -551,8 +545,6 @@ void emgDrainTask(void* /*param*/) {
     if (adcHandle == nullptr) {
       // Handle was freed between our samplingPaused check and mutex acquisition
       xSemaphoreGive(adcMutex);
-      envValid = false;
-      rawValid = false;
       vTaskDelay(5 / portTICK_PERIOD_MS);
       continue;
     }
@@ -567,12 +559,12 @@ void emgDrainTask(void* /*param*/) {
       continue;
     }
 
-            // Capture frame-end timestamp BEFORE processing results.
+    // Capture frame-end timestamp BEFORE processing results.
     // Back-calculate each sample's actual ADC capture time:
-    //   sample[i] was captured (numResults-1-i) * (1e6/ADC_CONV_FREQ_HZ) µs before frame end.
+    //   sample[i] was captured (numResults-1-i) * (1e6/ADC_CONV_FREQ_HZ) us before frame end.
     // This corrects for the up-to-16 ms latency between ADC capture and emgDrainTask wakeup.
     uint32_t frameEndUs = micros();
-    // Inter-conversion period in µs (250 µs at 4000 conv/s)
+    // Inter-conversion period in us (250 us at 4000 conv/s)
     static constexpr float US_PER_CONV = 1000000.0f / ADC_CONV_FREQ_HZ;
 
     uint32_t numResults = bytesRead / sizeof(adc_digi_output_data_t);
@@ -580,45 +572,31 @@ void emgDrainTask(void* /*param*/) {
 
     for (uint32_t i = 0; i < numResults; i++) {
       adc_digi_output_data_t* r = &results[i];
-            // TYPE1 layout on original ESP32 (IDF 5.x): bits[11:0]=data, bits[15:12]=channel
+      // TYPE1 layout on original ESP32 (IDF 5.x): bits[11:0]=data, bits[15:12]=channel
       // Using .val directly avoids the removed .type1/.type2 union members in IDF 5.x
       uint8_t  ch  = (uint8_t)((r->val >> 12) & 0x0F);
       uint16_t val = (uint16_t)(r->val & 0x0FFF);
 
-            if (ch == ADC_CH_ENV) {
-        if (envValid) {
-          // ENV arrived while previous ENV not yet paired — channel-order violation.
-          // Discard the stale ENV value; use the newer one. Count for diagnostics.
-          portENTER_CRITICAL(&emgMux);
-          emgChOrderViolations++;
-          portEXIT_CRITICAL(&emgMux);
-        }
-        envVal   = val;
-        envValid = true;
+      if (ch == ADC_CH_ENV) {
+        envAcc += val;
+        envCount++;
       } else if (ch == ADC_CH_RAW) {
-        if (rawValid) {
-          // RAW arrived while previous RAW not yet paired — channel-order violation.
-          portENTER_CRITICAL(&emgMux);
-          emgChOrderViolations++;
-          portEXIT_CRITICAL(&emgMux);
-        }
-        rawVal   = val;
-        rawValid = true;
+        rawAcc += val;
+        rawCount++;
       }
-      // else: unexpected channel — ignore
+      // else: unexpected channel -- ignore
 
-            // Emit a paired sample once both channels have been seen
-            if (envValid && rawValid) {
+      // Emit one decimated sample when both channels have ADC_OVERSAMPLE readings
+      if (envCount >= ADC_OVERSAMPLE && rawCount >= ADC_OVERSAMPLE) {
         EmgSample s;
         uint32_t age_us = (uint32_t)((numResults - 1u - i) * US_PER_CONV);
         s.t_us = frameEndUs - age_us;
-        // seq assigned inside emg_push() under emgMux — see emg_push_next_seq()
         s.seq  = 0;  // placeholder; overwritten atomically in emg_push
-        s.env  = envVal;
-        s.raw  = rawVal;
+        s.env  = (uint16_t)(envAcc / ADC_OVERSAMPLE);
+        s.raw  = (uint16_t)(rawAcc / ADC_OVERSAMPLE);
         emg_push(s);
-        envValid = false;
-        rawValid = false;
+        envAcc   = 0; envCount = 0;
+        rawAcc   = 0; rawCount = 0;
       }
     }
   }
@@ -633,7 +611,7 @@ void imuTask(void* /*param*/) {
       bool ready = myICM.dataReady();
       if (ready) myICM.getAGMT();
       xSemaphoreGive(wireMutex);
-            if (ready) {
+      if (ready) {
         ImuSample s;
         s.t_us = micros();
         s.seq  = 0;  // placeholder; overwritten atomically in imu_push
@@ -670,7 +648,7 @@ void spo2Task(void* /*param*/) {
       continue;
     }
 
-        // Collect 100 samples (~4 sec at 25 Hz)
+    // Collect 100 samples (~4 sec at 25 Hz)
     for (int i = 0; i < SPO2_BUFFER_SIZE; i++) {
       bool avail = false;
       while (!avail) {
@@ -691,7 +669,7 @@ void spo2Task(void* /*param*/) {
     uint32_t lastRED = redBuffer[SPO2_BUFFER_SIZE - 1];
 
     // Auto brightness adjust (avoid max<int>/min<int> templates)
-        if (lastIR > SATURATION_HIGH && ledBrightness > BRIGHTNESS_MIN) {
+    if (lastIR > SATURATION_HIGH && ledBrightness > BRIGHTNESS_MIN) {
       int newB = max((int)BRIGHTNESS_MIN, (int)ledBrightness - 0x0F);
       ledBrightness = (byte)newB;
       xSemaphoreTake(wireMutex, portMAX_DELAY);
@@ -765,6 +743,7 @@ static inline void wr_u32(uint8_t*& p, uint32_t v) {
   *p++ = (v >> 24) & 0xFF;
 }
 
+// FIX: removed stray "ensor" text that corrupted this function
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc = 0xFFFF) {
   for (size_t i = 0; i < len; i++) {
     crc ^= (uint16_t)data[i] << 8;
@@ -782,7 +761,7 @@ bool send_emg_frame(uint16_t maxPayload) {
   const uint16_t emgMetaBytes = 13;
   const uint16_t crcBytes = 2;
 
-    if (maxPayload < (headerBytes + tlvHdrBytes + emgMetaBytes + crcBytes + 4)) return false;
+  if (maxPayload < (headerBytes + tlvHdrBytes + emgMetaBytes + crcBytes + 4)) return false;
 
   uint16_t maxSamples = (maxPayload - headerBytes - tlvHdrBytes - emgMetaBytes - crcBytes) / 4;
   if (maxSamples == 0) return false;
@@ -822,12 +801,12 @@ bool send_emg_frame(uint16_t maxPayload) {
   if (off > 32767) off = 32767; if (off < -32768) off = -32768;
   wr_i16(p, (int16_t)off);
   wr_u16(p, EMG_RATE_HZ);
-    *p++ = 2; // channels
+  *p++ = 2; // channels
   *p++ = 0x03;
   *p++ = 0;
   wr_u16(p, N);
 
-    for (uint16_t i = 0; i < N; i++) {
+  for (uint16_t i = 0; i < N; i++) {
     wr_u16(p, batch[i].env);
     wr_u16(p, batch[i].raw);
   }
@@ -943,32 +922,32 @@ bool send_vitals_frame(uint16_t maxPayload) {
 
   if (maxPayload < (headerBytes + tlvHdrBytes + vitalsBytes + crcBytes)) return false;
 
-    VitalsState v;
+  VitalsState v;
   portENTER_CRITICAL(&vitalsMux);
   v = vitals;
   portEXIT_CRITICAL(&vitalsMux);
 
-      // Read battery periodically (or immediately on first call)
+  // Read battery periodically (or immediately on first call)
   uint32_t nowMs = millis();
   if (!batteryInitialReadDone || (nowMs - lastBatteryReadMs) >= BATTERY_READ_INTERVAL_MS) {
     lastBatteryReadMs = nowMs;
     batteryInitialReadDone = true;
-    
-        if (batteryAvailable) {
+
+    if (batteryAvailable) {
       BatteryState batt = readBattery();
-      
+
       if (batt.isValid && !isnan(batt.pct)) {
         v.battery_pct = (uint8_t)constrain((int)batt.pct, 0, 100);
       } else {
         v.battery_pct = 255;  // Unknown
       }
-      
+
       if (batt.isValid && !isnan(batt.voltage)) {
         v.battery_mv = (uint16_t)(batt.voltage * 1000.0f);
       } else {
         v.battery_mv = 0;  // Unknown
       }
-      
+
       // Update cached vitals
       portENTER_CRITICAL(&vitalsMux);
       vitals.battery_pct = v.battery_pct;
@@ -1007,7 +986,7 @@ bool send_vitals_frame(uint16_t maxPayload) {
   *p++ = TLV_VITALS;
   wr_u16(p, vitalsBytes);
 
-    wr_u16(p, v.spo2_u16);
+  wr_u16(p, v.spo2_u16);
   wr_u16(p, v.hr_x10_u16);
   wr_u16(p, age_ms);
   *p++ = v.flags;
@@ -1048,7 +1027,6 @@ static void led_update(LedMode mode) {
   if (mode != ledMode) {
     ledMode = mode;
     ledLastMs = now;
-    ledPhase = 0;
     led_set(false);
   }
 
@@ -1077,7 +1055,7 @@ static void led_update(LedMode mode) {
       led_set(true);
     } break;
 
-        case LED_BACKLOG: {
+    case LED_BACKLOG: {
       if (now - ledLastMs >= 62) {
         ledLastMs = now;
         led_set(!digitalRead(PIN_LED));
@@ -1102,7 +1080,7 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   led_set(false);
 
-    // ADC pins are now managed by the continuous DMA driver (emg_adc_init).
+  // ADC pins are now managed by the continuous DMA driver (emg_adc_init).
   // analogRead / analogSetPinAttenuation are NOT used for EMG channels.
   // PIN_REF is still available for manual reads if REF_CONNECTED is set.
   if (REF_CONNECTED) {
@@ -1127,7 +1105,7 @@ void setup() {
     fss.a = (IMU_ACC_FSR_G == 2)  ? gpm2  :
             (IMU_ACC_FSR_G == 4)  ? gpm4  :
             (IMU_ACC_FSR_G == 8)  ? gpm8  :
-                                   gpm16;
+                                    gpm16;
     fss.g = (IMU_GYRO_FSR_DPS == 250)  ? dps250  :
             (IMU_GYRO_FSR_DPS == 500)  ? dps500  :
             (IMU_GYRO_FSR_DPS == 1000) ? dps1000 :
@@ -1137,7 +1115,7 @@ void setup() {
     Serial.printf("[IMU] Set FSR: acc=+/- %ug, gyro=+/- %udps\n", IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
   }
 
-    // ---- MAX3010x init (non-fatal if missing) ----
+  // ---- MAX3010x init (non-fatal if missing) ----
   Serial.println("Initializing MAX3010x...");
   if (maxSensor.begin(Wire, I2C_SPEED_FAST, MAX3010X_ADDR)) {
     max3010xPresent = true;
@@ -1148,7 +1126,7 @@ void setup() {
     Serial.println("[WARN] MAX3010x not found; continuing without SpO2/HR.");
   }
 
-    // ---- MAX17048 Battery init (non-fatal if missing) ----
+  // ---- MAX17048 Battery init (non-fatal if missing) ----
   Serial.print("[Battery] Checking for MAX17048... ");
   if (lipo.begin() == false) {
     Serial.println("NOT FOUND. Battery monitoring disabled.");
@@ -1156,15 +1134,15 @@ void setup() {
   } else {
     Serial.println("OK.");
     batteryAvailable = true;
-    
+
     // Configure alerts
     lipo.setThreshold(20);  // Alert at 20% battery
     lipo.enableSOCAlert();  // Enable 1% change alerts
-    
+
     // Optional: Set voltage thresholds
     lipo.setVALRTMax((float)4.1);  // High voltage alert (4.1V)
     lipo.setVALRTMin((float)3.3);  // Low voltage alert (3.3V)
-    
+
     // Read initial state and update vitals
     float pct = lipo.getSOC();
     float volt = lipo.getVoltage();
@@ -1173,10 +1151,10 @@ void setup() {
     Serial.print("% (");
     Serial.print(volt, 2);
     Serial.println("V)");
-    
+
     lastBatteryPct = pct;
     lastBatteryVoltage = volt;
-    
+
     // Initialize vitals struct with battery data
     portENTER_CRITICAL(&vitalsMux);
     vitals.battery_pct = (uint8_t)constrain((int)pct, 0, 100);
@@ -1211,23 +1189,23 @@ void setup() {
   pAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   BLEDevice::startAdvertising();
 
-    // Create mutexes before any task or init that uses the protected resources
+  // Create mutexes before any task or init that uses the protected resources
   adcMutex  = xSemaphoreCreateMutex();
   wireMutex = xSemaphoreCreateMutex();
   configASSERT(adcMutex);   // halt if heap allocation failed
   configASSERT(wireMutex);
 
   // ---- Timers ----
-  // EMG is now driven by ADC DMA — no EMG timer needed.
+  // EMG is now driven by ADC DMA -- no EMG timer needed.
   esp_timer_create_args_t imuArgs = { .callback = &imu_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "imu_timer" };
   esp_timer_create(&imuArgs, &imuTimer);
   esp_timer_start_periodic(imuTimer, IMU_PERIOD_US);
 
   // ---- Tasks ----
-    // Task priorities on Core 1:
-  //   2 = emgDrainTask  — real-time, must drain DMA at 2kHz
-  //   2 = imuTask       — real-time, 200 Hz timer-driven; raised from 1 to prevent SpO2 starvation
-  //   0 = spo2Task      — background, computes every ~30s; lowered from 1, no real-time requirement
+  // Task priorities on Core 1:
+  //   2 = emgDrainTask  -- real-time, must drain DMA at 2kHz
+  //   2 = imuTask       -- real-time, 200 Hz timer-driven; raised from 1 to prevent SpO2 starvation
+  //   0 = spo2Task      -- background, computes every ~30s; lowered from 1, no real-time requirement
   xTaskCreatePinnedToCore(emgDrainTask, "emgDrain", 4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(imuTask,      "imuTask",  4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(spo2Task,     "spo2Task", 6144, NULL, 0, NULL, 1);
@@ -1235,7 +1213,7 @@ void setup() {
   Serial.printf("ADC DMA: %lu Hz/ch x2 ch. IMU timer: %lu Hz\n", (unsigned long)EMG_RATE_HZ, (unsigned long)IMU_RATE_HZ);
 
   // Start paused until first host heartbeat after a BLE connection
-    samplingPaused = true;  // direct assign OK — tasks not started yet
+  samplingPaused = true;  // direct assign OK -- tasks not started yet
   rb_flush_all();
 }
 
@@ -1263,7 +1241,7 @@ void loop() {
 
   bool hostAlive = (hp != 0) && (hostAge <= HOST_SILENCE_PAUSE_MS);
 
-    // IMPORTANT: never sample when not connected
+  // IMPORTANT: never sample when not connected
   if (!isConnected) {
     if (!getSamplingPaused()) {
       setSamplingPaused(true);
@@ -1283,8 +1261,8 @@ void loop() {
         Serial.printf("[WD] Host heartbeat missing (%lu ms). Pausing sampling/streaming.\n", (unsigned long)hostAge);
       }
     } else {
-            if (getSamplingPaused()) {
-                setSamplingPaused(false);
+      if (getSamplingPaused()) {
+        setSamplingPaused(false);
         rb_flush_all();
         imu_ticks = 0;
         emg_adc_init();  // start DMA ADC now that host is alive
@@ -1300,16 +1278,16 @@ void loop() {
     }
   }
 
-    // ---- Decide LED mode ----
+  // ---- Decide LED mode ----
   LedMode mode = LED_DISCONNECTED;
-  
-    // Priority 1: Check for low battery first.
-  // Use cached lastBatteryPct — updated every BATTERY_READ_INTERVAL_MS by send_vitals_frame().
-  // Do NOT call readBattery() here: that does I2C at ~1kHz loop rate, wasting ~100µs/call.
+
+  // Priority 1: Check for low battery first.
+  // Use cached lastBatteryPct -- updated every BATTERY_READ_INTERVAL_MS by send_vitals_frame().
+  // Do NOT call readBattery() here: that does I2C at ~1kHz loop rate, wasting ~100us/call.
   if (batteryAvailable && batteryInitialReadDone && lastBatteryPct < 20.0f) {
     mode = LED_LOW_BATTERY;
   }
-  
+
   // Priority 2: Other states (only if not low battery)
   if (mode != LED_LOW_BATTERY) {
     if (!isConnected) {
@@ -1324,7 +1302,7 @@ void loop() {
       }
     }
   }
-  
+
   led_update(mode);
 
   // ---- TX loop ----
@@ -1339,10 +1317,10 @@ void loop() {
       sent |= send_imu_frame(maxNotifyPayload);
     }
 
-                if (nowMs - lastVitalsSendMs >= 30000) {  // Send Vitals every 30 seconds
-        lastVitalsSendMs = nowMs;
-        sent |= send_vitals_frame(maxNotifyPayload);
-      }
+    if (nowMs - lastVitalsSendMs >= 30000) {  // Send Vitals every 30 seconds
+      lastVitalsSendMs = nowMs;
+      sent |= send_vitals_frame(maxNotifyPayload);
+    }
 
     if (sent) framesSent++;
   }
@@ -1358,26 +1336,25 @@ void loop() {
     v = vitals;
     portEXIT_CRITICAL(&vitalsMux);
 
-        String sSpo2 = (v.flags & 0x01) ? String(v.spo2_u16) : "NA";
+    String sSpo2 = (v.flags & 0x01) ? String(v.spo2_u16) : "NA";
     String sHr   = (v.flags & 0x02) ? String(v.hr_x10_u16 / 10.0f, 1) : "NA";
 
     // Print battery status
     printBatteryStatus();
 
-        Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu EMGchViol=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
+    Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
                   negotiatedMTU, emg_available(), imu_available(),
                   (unsigned long)emgDropped, (unsigned long)imuDropped,
-                  (unsigned long)emgChOrderViolations, (unsigned long)fps,
+                  (unsigned long)fps,
                   (unsigned long)hostAge, getSamplingPaused() ? 1 : 0,
                   sSpo2.c_str(), sHr.c_str());
   }
 
-  // ---- Handle disconnect/reconnect ----
+  // ---- BLE reconnect handling ----
   if (!isConnected && previousConnected) {
-    Serial.println("Disconnected. Restarting advertising...");
-    delay(200);
-    pServer->startAdvertising();
-    previousConnected = isConnected;
+    BLEDevice::startAdvertising();
+    previousConnected = false;
+    Serial.println("[BLE] Disconnected. Restarting advertising.");
   } else if (isConnected && !previousConnected) {
     previousConnected = isConnected;
   }

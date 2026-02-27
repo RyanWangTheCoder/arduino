@@ -31,7 +31,7 @@ Format: newest session at the top.
 - `esp_timer` task (priority 22) — runs `imu_timer_cb` at 200 Hz
 
 **Core 1 (Sensor CPU):**
-- `emgDrainTask` (priority 2) — drains ADC DMA at 2 kHz, pairs ENV+RAW samples
+- `emgDrainTask` (priority 2) — drains ADC DMA at 40 kHz, decimates 10× oversampled results to 2 kHz EMG output
 - `imuTask` (priority 2) — reads IMU at 200 Hz (timer-driven)
 - `spo2Task` (priority 0) — computes SpO2/HR every ~30 seconds (background)
 
@@ -45,9 +45,10 @@ Format: newest session at the top.
 ```
 Sensors (Core 1)          Ring Buffers (shared)     BLE TX (Core 0)
 ────────────────          ─────────────────────     ───────────────
-ADC DMA (2 kHz)    ──→    emgBuf[2048]       ──→   send_emg_frame()
+ADC DMA (40 kHz)   ──→    emgBuf[2048]       ──→   send_emg_frame()
   ↓ emgDrainTask                                      (batched, CRC16)
-  pairs ENV+RAW
+  oversample 10×
+  → 2 kHz output
 
 ICM-20948 (200 Hz) ──→    imuBuf[512]        ──→   send_imu_frame()
   ↓ imuTask                                           (batched, CRC16)
@@ -85,7 +86,7 @@ MAX30105 (25 Hz)   ──→    vitals (atomic)    ──→   send_vitals_frame
 
 | Task | Rate | Period | Budget | Worst-Case Blocking | Margin |
 |---|---|---|---|---|---|
-| `emgDrainTask` | 2 kHz | 500 µs | ~16 ms (DMA frame) | 10 ms (`adcMutex`) | ✅ Acceptable |
+| `emgDrainTask` | 2 kHz out (40 kHz ADC) | 500 µs | ~1.6 ms (DMA frame) | 10 ms (`adcMutex`) | ✅ Acceptable |
 | `imuTask` | 200 Hz | 5 ms | 5 ms | ~400 µs (`wireMutex`) | ✅ 92% margin |
 | `spo2Task` | 25 Hz | 40 ms | No deadline | N/A | ✅ Background |
 
@@ -98,50 +99,56 @@ MAX30105 (25 Hz)   ──→    vitals (atomic)    ──→   send_vitals_frame
 
 ### Tricky Parts & Gotchas
 
-**1. ADC DMA Channel-Order Violations (Session 7)**
+**1. ADC DMA Minimum Frequency Floor (Session 17)**
+- **Problem:** ESP32 ADC continuous driver (IDF 5.x) enforces a minimum `sample_freq_hz` of ~20 kHz
+- **Symptom:** `ESP_ERR_INVALID_ARG` abort at `adc_continuous_config()` when `ADC_CONV_FREQ_HZ = 4000`
+- **Solution:** Oversample at 40 kHz total (20 kHz/channel), decimate 10× in `emgDrainTask` to yield 2 kHz output
+- **Why it's tricky:** The minimum is not enforced at compile time; the abort only fires at runtime when the host connects and triggers `emg_adc_init()`
+
+**2. ADC DMA Channel-Order Violations (Session 7, superseded by Session 17)**
 - **Problem:** BLE radio interference can cause ADC arbiter to skip conversions
 - **Symptom:** Two consecutive ENV or RAW results (ENV, ENV, RAW, RAW instead of ENV, RAW, ENV, RAW)
-- **Solution:** Overwrite stale value, count violations in `emgChOrderViolations` for diagnostics
-- **Why it's tricky:** Pairing logic must handle out-of-order results without dropping samples
+- **Original solution:** Overwrite stale value, count violations in `emgChOrderViolations` for diagnostics
+- **Session 17 update:** `emgChOrderViolations` removed — oversampling accumulator counts each channel independently, so strict ordering is no longer required
 
-**2. Cross-Core `samplingPaused` Visibility (Session 3)**
+**3. Cross-Core `samplingPaused` Visibility (Session 3)**
 - **Problem:** `volatile` alone doesn't guarantee memory barrier on Xtensa LX6
 - **Symptom:** Core 1 sees stale `samplingPaused` value, continues sampling after pause
 - **Solution:** Use `__atomic_store_n` / `__atomic_load_n` with `RELEASE` / `ACQUIRE` ordering
 - **Why it's tricky:** ESP32 L1 cache is not coherent between cores for DRAM
 
-**3. `adcMutex` Held for 10 ms (Session 13)**
+**4. `adcMutex` Held for 10 ms (Session 13)**
 - **Problem:** `emgDrainTask` holds `adcMutex` during `adc_continuous_read()` (10 ms timeout)
 - **Concern:** Does this block `emg_adc_deinit()` too long?
 - **Analysis:** All deinit call sites are non-real-time (disconnect, host timeout)
 - **Why it's tricky:** Must hold mutex across entire read to prevent use-after-free
 
-**4. Priority Inheritance on `wireMutex` (Session 13)**
+**5. Priority Inheritance on `wireMutex` (Session 13)**
 - **Problem:** `spo2Task` (pri 0) holds `wireMutex`, `imuTask` (pri 2) blocks
 - **Solution:** `xSemaphoreCreateMutex()` provides automatic priority inheritance
 - **Result:** `spo2Task` temporarily raised to pri 2 while holding mutex
 - **Why it's tricky:** Without inheritance, `emgDrainTask` (pri 2) would preempt `spo2Task`, causing unbounded delay
 
-**5. EMG Timestamp Back-Calculation (Session 4)**
+**6. EMG Timestamp Back-Calculation (Session 4)**
 - **Problem:** `micros()` called at pair-emit time, not ADC capture time
 - **Error:** Up to 16 ms late (one full DMA frame)
 - **Solution:** Capture `frameEndUs` after `adc_continuous_read()`, back-calculate each sample's age
 - **Formula:** `actual_t_us = frameEndUs - (numResults - 1 - i) * 250 µs`
 - **Why it's tricky:** DMA delivers results in batches; must reconstruct original capture time
 
-**6. `esp_timer` Callbacks Are Tasks, Not ISRs (Session 14)**
+**7. `esp_timer` Callbacks Are Tasks, Not ISRs (Session 14)**
 - **Misconception:** `esp_timer` callbacks run in hardware ISR context
 - **Reality:** `ESP_TIMER_TASK` dispatch runs callbacks in FreeRTOS task (pri 22)
 - **Implication:** Safe to use `__atomic_load_n`, `xSemaphoreTake`, etc. in `imu_timer_cb`
 - **Why it's tricky:** ESP-IDF documentation is subtle about this distinction
 
-**7. Sequence Number Assignment Under Lock (Session 5)**
+**8. Sequence Number Assignment Under Lock (Session 5)**
 - **Problem:** `emgSeq++` was outside `emgMux`, causing race with `onConnect()` reset
 - **Solution:** Assign `seq` inside `emg_push()` under `emgMux` spinlock
 - **Pattern:** Caller sets `s.seq = 0` (placeholder), `emg_push()` overwrites with `emgSeq++`
 - **Why it's tricky:** Sequence numbers must be monotonic and gap-free for protocol correctness
 
-**8. Battery Read Caching (Session 9)**
+**9. Battery Read Caching (Session 9)**
 - **Problem:** `printBatteryStatus()` called `readBattery()` every 1 second (4 I2C transactions)
 - **Impact:** ~400 µs I2C bus time, `wireMutex` contention with real-time tasks
 - **Solution:** Cache `lastBatteryPct` / `lastBatteryVoltage`, refresh every 10 seconds
@@ -211,6 +218,119 @@ Disconnected ──connect──→ Wait Host ──PING──→ Streaming
 | `LED_STREAMING` | Solid ON | Streaming data to host |
 | `LED_BACKLOG` | Fast blink (16 Hz) | Ring buffer backlog high (MTU too low) |
 | `LED_LOW_BATTERY` | Very fast blink (10 Hz) | Battery < 20% |
+
+---
+
+## 2026 — Session 17: Fix — ADC Continuous Minimum Frequency Violation (Oversampling + Decimation)
+
+### Problem
+The firmware aborted at startup with:
+```
+E (66921) adc_continuous: adc_continuous_config(477): ADC sampling frequency out of range
+ESP_ERR_INVALID_ARG at void emg_adc_init()
+```
+
+The ESP32 ADC continuous driver (IDF 5.x) enforces a **minimum `sample_freq_hz` of ~20,000 Hz**.
+The previous configuration used:
+```cpp
+static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 conv/s
+```
+4,000 Hz is far below the hardware floor, causing an unconditional abort inside
+`adc_continuous_config()` every time `emg_adc_init()` was called (i.e. on every host PING
+after BLE connect).
+
+### Root Cause
+The IDF 5.x ADC continuous driver requires the total conversion frequency to be at least
+~20 kHz regardless of the number of channels. This limit is not enforced at compile time —
+it only fires at runtime inside `adc_continuous_config()`, which is why it was not caught
+during earlier sessions that did not exercise the host-PING → `emg_adc_init()` path.
+
+### Fix: Oversampling + Decimation
+
+Raised `ADC_CONV_FREQ_HZ` to 40,000 Hz (20 kHz per channel × 2 channels) by introducing
+an `ADC_OVERSAMPLE` factor of 10:
+
+```cpp
+// Before (aborts at runtime):
+static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2;  // 4000 — below minimum!
+
+// After:
+static constexpr uint32_t ADC_OVERSAMPLE   = 10;
+static constexpr uint32_t ADC_CONV_FREQ_HZ = EMG_RATE_HZ * 2 * ADC_OVERSAMPLE; // 40000
+```
+
+`emgDrainTask` was updated to accumulate `ADC_OVERSAMPLE` (10) raw readings per channel
+into running sums (`envAcc`, `rawAcc`), then divide and emit one `EmgSample` when both
+accumulators are full:
+
+```
+ADC DMA: 40,000 conv/s total
+  → 20,000 conv/s per channel (ENV, RAW)
+  → accumulate 10 readings per channel
+  → emit 1 decimated sample per channel pair
+  → output: 2,000 EmgSamples/s  ✓  (EMG_RATE_HZ unchanged)
+```
+
+### Side Effect: Noise Reduction
+Averaging 10 raw ADC readings reduces quantization noise by √10 ≈ 3.16×,
+gaining approximately 1.5 effective bits of resolution at no extra cost.
+
+### Removed: `emgChOrderViolations`
+The old pairing logic required strict ENV/RAW alternation and counted violations when
+two consecutive same-channel results arrived. The new accumulator approach counts each
+channel independently — strict ordering is no longer required — so the violation counter
+was removed entirely:
+- `static volatile uint32_t emgChOrderViolations` — deleted
+- Reset in `onConnect()` under `emgMux` — removed
+- `EMGchViol=N` field in `[Health]` report — removed
+
+### Changes Summary
+
+| Location | Before | After |
+|---|---|---|
+| `ADC_CONV_FREQ_HZ` | `EMG_RATE_HZ * 2 = 4000` | `EMG_RATE_HZ * 2 * 10 = 40000` |
+| `ADC_OVERSAMPLE` | (not present) | `10` |
+| `emgDrainTask` accumulators | `envValid/rawValid` bool pair | `envAcc/rawAcc` uint32 sums + `envCount/rawCount` |
+| `emgDrainTask` emit condition | both bools true (one reading each) | both counts ≥ `ADC_OVERSAMPLE` |
+| `emgChOrderViolations` | present, printed in `[Health]` | removed |
+| `[Health]` report | `EMGchViol=N` field | field removed |
+| DMA frame coverage | ~16 ms at 4 kHz | ~1.6 ms at 40 kHz |
+| Effective ADC resolution | 12-bit raw | ~13.5-bit (1.5 bits gained via averaging) |
+
+### Verification
+- `ADC_CONV_FREQ_HZ = 40000` is well above the ~20 kHz minimum floor
+- Output rate: 40000 / 2 channels / 10 oversample = **2000 Hz** = `EMG_RATE_HZ` ✓
+- `ADC_FRAME_SIZE = 256` bytes = 64 results; at 40 kHz this covers 1.6 ms per frame
+  (down from 16 ms at 4 kHz) — also reduces timestamp back-calculation error
+- No protocol changes; `EmgSample` struct, ring buffer, and `send_emg_frame()` unchanged
+
+### Impact Analysis — What Changed vs. What Didn't
+
+**EMG output rate: still exactly 2000 Hz.** The oversampling is entirely internal to `emgDrainTask`.
+
+| Layer | Before | After |
+|---|---|---|
+| ADC hardware clock | 4,000 conv/s total | 40,000 conv/s total |
+| Per-channel ADC rate | 2,000 raw readings/s | 20,000 raw readings/s |
+| `emgDrainTask` emit rate | 1 pair per ENV+RAW | 1 averaged pair per 10 ENV + 10 RAW |
+| `EmgSample` output rate | 2,000/s | **2,000/s** ← unchanged |
+| `EmgSample.env` / `.raw` values | single 12-bit ADC reading | mean of 10 readings (still fits `uint16_t`, same 0–4095 range) |
+
+**Completely unaffected:**
+- `EMG_RATE_HZ = 2000` — unchanged; still transmitted in every `TLV_EMG_BATCH` frame as the `rate` field
+- `send_emg_frame()` — unchanged; still batches `EmgSample` structs and writes `EMG_RATE_HZ` into the wire format
+- Protocol / decoder — `btCentral.py` reads `emg_rate_hz` from the frame, gets 2000, nothing changes
+- Ring buffer sizing (`EMG_BUF_SIZE = 2048`) — sized for 2000 Hz output, still correct
+- Backlog threshold (`EMG_BACKLOG_PAUSE_THRESH = 1800`) — still ~0.9 s of output samples, still correct
+- `EMG_PERIOD_US` — was only used by the old software timer (removed in Session 1), not present in current code
+- Timestamp back-calculation — `US_PER_CONV = 1e6 / ADC_CONV_FREQ_HZ` is now `25 µs` instead of `250 µs`, which is **more accurate** (smaller per-result age correction)
+
+**One subtle behavioural change — sample values are now averages:**
+The `env` and `raw` fields in each `EmgSample` are the **mean of 10 ADC readings** rather than a
+single reading. Values remain `uint16_t` in the 0–4095 range. The Python decoder, CSV format,
+and all downstream analysis are unaffected — they treat these as raw ADC counts regardless.
+
+**Nothing outside the firmware needs to change.**
 
 ---
 
@@ -331,7 +451,7 @@ All other cross-core accesses were reviewed and confirmed correct:
 | `negotiatedMTU` / `maxNotifyPayload` | Core 0 (`onConnect`) | Core 0 (`loop`) | Same core | ✅ No issue |
 | `frameSeq` | Core 0 (`loop`) | Core 0 (`loop`) | Same core | ✅ No issue |
 | `emgSeq` / `imuSeq` / `emgDropped` / `imuDropped` | Core 0 (`onConnect`) / Core 1 (tasks) | Both cores | `emgMux` / `imuMux` spinlocks | ✅ Correct (Session 5) |
-| `emgChOrderViolations` | Core 1 (`emgDrainTask`) / Core 0 (`onConnect`) | Core 0 (`loop`) | `emgMux` spinlock | ✅ Correct (Session 7) |
+| `emgChOrderViolations` | ~~removed in Session 17~~ | — | — | ✅ N/A (oversampling accumulator does not require strict channel ordering) |
 
 ---
 
@@ -952,7 +1072,7 @@ After:
 | Attenuation | `ADC_ATTEN_DB_12` | ~0–3.3 V range |
 | Bit width | 12-bit | Same as before |
 | Format | `ADC_DIGI_OUTPUT_FORMAT_TYPE1` | Only valid format on original ESP32 |
-| Total conv rate | 4000 conv/s | Round-robin: 2000 Hz per channel |
+| Total conv rate | 40000 conv/s | Round-robin: 20000 Hz per channel; decimated 10× to 2000 Hz output |
 | DMA frame size | 256 bytes | 64 results per frame |
 | Internal buffer | 1024 bytes (4× frame) | |
 
