@@ -392,7 +392,22 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 static esp_timer_handle_t imuTimer = nullptr;
 
 // Use counter instead of bool to avoid losing ticks
+// Atomic to prevent race between imu_timer_cb (ISR) and imuTask (Core 1)
 static volatile uint32_t imu_ticks = 0;
+
+// Atomic accessors for imu_ticks
+static inline void incrementImuTicks() {
+  __atomic_add_fetch(&imu_ticks, 1, __ATOMIC_RELEASE);
+}
+static inline uint32_t decrementImuTicks() {
+  return __atomic_sub_fetch(&imu_ticks, 1, __ATOMIC_ACQUIRE);
+}
+static inline uint32_t getImuTicks() {
+  return __atomic_load_n(&imu_ticks, __ATOMIC_ACQUIRE);
+}
+static inline void clearImuTicks() {
+  __atomic_store_n(&imu_ticks, 0, __ATOMIC_RELEASE);
+}
 
 // IMPORTANT: start paused so we don't sample/drop when no host is consuming
 static volatile bool samplingPaused = true;
@@ -462,7 +477,7 @@ static void emg_adc_deinit() {
 // ==================== IMU timer ====================
 static void imu_timer_cb(void* /*arg*/) {
   if (getSamplingPaused()) return;
-  imu_ticks++;
+  incrementImuTicks();
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -496,7 +511,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     // We'll reset it in loop once connected and before first send.
 
     rb_flush_all();
-    imu_ticks = 0;
+    clearImuTicks();
     setSamplingPaused(true);  // atomic write -- emgDrainTask on Core 1 reads this
     // ADC DMA will be started by loop() when host heartbeat arrives
   }
@@ -508,7 +523,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     emg_adc_deinit();  // stop DMA while disconnected to save power
     clearHostPing();
     rb_flush_all();
-    imu_ticks = 0;
+    clearImuTicks();
   }
 };
 
@@ -605,8 +620,8 @@ void emgDrainTask(void* /*param*/) {
 // ==================== IMU Task ====================
 void imuTask(void* /*param*/) {
   for (;;) {
-    if (imu_ticks > 0) {
-      imu_ticks--;
+    if (getImuTicks() > 0) {
+      decrementImuTicks();
       xSemaphoreTake(wireMutex, portMAX_DELAY);
       bool ready = myICM.dataReady();
       if (ready) myICM.getAGMT();
@@ -1247,7 +1262,7 @@ void loop() {
       setSamplingPaused(true);
       emg_adc_deinit();  // stop DMA on disconnect
       rb_flush_all();
-      imu_ticks = 0;
+      clearImuTicks();
       Serial.println("[WD] Disconnected. Pausing sampling.");
     }
   } else {
@@ -1257,14 +1272,14 @@ void loop() {
         setSamplingPaused(true);
         emg_adc_deinit();  // stop DMA while host is absent
         rb_flush_all();
-        imu_ticks = 0;
+        clearImuTicks();
         Serial.printf("[WD] Host heartbeat missing (%lu ms). Pausing sampling/streaming.\n", (unsigned long)hostAge);
       }
     } else {
       if (getSamplingPaused()) {
         setSamplingPaused(false);
         rb_flush_all();
-        imu_ticks = 0;
+        clearImuTicks();
         emg_adc_init();  // start DMA ADC now that host is alive
         Serial.println("[WD] Host heartbeat present. Resuming sampling/streaming.");
       }
