@@ -220,6 +220,7 @@ static void rb_flush_all() {
 // ==================== Sensors ====================
 ICM_20948_I2C myICM;
 static constexpr uint8_t AD0_VAL = 1;
+static bool imuPresent = false;  // Track IMU availability (like max3010xPresent)
 
 // MAX3010x
 MAX30105 maxSensor;
@@ -619,7 +620,46 @@ void emgDrainTask(void* /*param*/) {
 
 // ==================== IMU Task ====================
 void imuTask(void* /*param*/) {
+  static uint32_t lastRetryMs = 0;
+  static constexpr uint32_t RETRY_INTERVAL_MS = 5000;  // Retry every 5 seconds
+  
   for (;;) {
+    // Hot-plug detection: periodically retry if IMU not present
+    if (!imuPresent) {
+      uint32_t now = millis();
+      if (now - lastRetryMs >= RETRY_INTERVAL_MS) {
+        lastRetryMs = now;
+        
+        xSemaphoreTake(wireMutex, portMAX_DELAY);
+        myICM.begin(Wire, AD0_VAL);
+        bool recovered = (myICM.status == ICM_20948_Stat_Ok);
+        xSemaphoreGive(wireMutex);
+        
+        if (recovered) {
+          // Configure FSR on recovery
+          ICM_20948_fss_t fss;
+          fss.a = (IMU_ACC_FSR_G == 2)  ? gpm2  :
+                  (IMU_ACC_FSR_G == 4)  ? gpm4  :
+                  (IMU_ACC_FSR_G == 8)  ? gpm8  :
+                                          gpm16;
+          fss.g = (IMU_GYRO_FSR_DPS == 250)  ? dps250  :
+                  (IMU_GYRO_FSR_DPS == 500)  ? dps500  :
+                  (IMU_GYRO_FSR_DPS == 1000) ? dps1000 :
+                                               dps2000;
+          
+          xSemaphoreTake(wireMutex, portMAX_DELAY);
+          myICM.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
+          xSemaphoreGive(wireMutex);
+          
+          imuPresent = true;
+          Serial.printf("[IMU] Recovered! Set FSR: acc=+/- %ug, gyro=+/- %udps\n", 
+                        IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
+        }
+      }
+      vTaskDelay(1000 / portTICK_PERIOD_MS);  // Check every second
+      continue;
+    }
+    
     if (getImuTicks() > 0) {
       decrementImuTicks();
       xSemaphoreTake(wireMutex, portMAX_DELAY);
@@ -1106,28 +1146,39 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);
 
-  // ---- IMU init ----
-  bool initialized = false;
-  while (!initialized) {
+  // ---- IMU init (timeout-based, non-fatal if missing) ----
+  Serial.println("Initializing IMU...");
+  int imuRetries = 10;  // 5 seconds total (10 retries × 500ms)
+  while (imuRetries > 0) {
     myICM.begin(Wire, AD0_VAL);
-    if (myICM.status == ICM_20948_Stat_Ok) initialized = true;
-    else { Serial.println("IMU init retry..."); delay(500); }
+    if (myICM.status == ICM_20948_Stat_Ok) {
+      imuPresent = true;
+      
+      // Explicit full-scale ranges (matches logged FSR)
+      ICM_20948_fss_t fss;
+      fss.a = (IMU_ACC_FSR_G == 2)  ? gpm2  :
+              (IMU_ACC_FSR_G == 4)  ? gpm4  :
+              (IMU_ACC_FSR_G == 8)  ? gpm8  :
+                                      gpm16;
+      fss.g = (IMU_GYRO_FSR_DPS == 250)  ? dps250  :
+              (IMU_GYRO_FSR_DPS == 500)  ? dps500  :
+              (IMU_GYRO_FSR_DPS == 1000) ? dps1000 :
+                                           dps2000;
+
+      myICM.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
+      Serial.printf("[IMU] OK. Set FSR: acc=+/- %ug, gyro=+/- %udps\n", IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
+      break;
+    }
+    
+    imuRetries--;
+    if (imuRetries > 0) {
+      Serial.println("IMU init retry...");
+      delay(500);
+    }
   }
 
-  // Explicit full-scale ranges (matches logged FSR)
-  {
-    ICM_20948_fss_t fss;
-    fss.a = (IMU_ACC_FSR_G == 2)  ? gpm2  :
-            (IMU_ACC_FSR_G == 4)  ? gpm4  :
-            (IMU_ACC_FSR_G == 8)  ? gpm8  :
-                                    gpm16;
-    fss.g = (IMU_GYRO_FSR_DPS == 250)  ? dps250  :
-            (IMU_GYRO_FSR_DPS == 500)  ? dps500  :
-            (IMU_GYRO_FSR_DPS == 1000) ? dps1000 :
-                                         dps2000;
-
-    myICM.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
-    Serial.printf("[IMU] Set FSR: acc=+/- %ug, gyro=+/- %udps\n", IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
+  if (!imuPresent) {
+    Serial.println("[WARN] IMU not found; continuing without motion data.");
   }
 
   // ---- MAX3010x init (non-fatal if missing) ----
@@ -1326,10 +1377,13 @@ void loop() {
 
     sent |= send_emg_frame(maxNotifyPayload);
 
-    static uint32_t lastImuSendMs = 0;
-    if (nowMs - lastImuSendMs >= 20 && emg_available() < EMG_BUF_SIZE * 3 / 4) {
-      lastImuSendMs = nowMs;
-      sent |= send_imu_frame(maxNotifyPayload);
+    // Only send IMU frames if IMU sensor is present
+    if (imuPresent) {
+      static uint32_t lastImuSendMs = 0;
+      if (nowMs - lastImuSendMs >= 20 && emg_available() < EMG_BUF_SIZE * 3 / 4) {
+        lastImuSendMs = nowMs;
+        sent |= send_imu_frame(maxNotifyPayload);
+      }
     }
 
     if (nowMs - lastVitalsSendMs >= 30000) {  // Send Vitals every 30 seconds
@@ -1357,8 +1411,9 @@ void loop() {
     // Print battery status
     printBatteryStatus();
 
-    Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u EMGdrop=%lu IMUdrop=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
+    Serial.printf("[Health] MTU=%u EMGavail=%u IMUavail=%u (IMU:%s) EMGdrop=%lu IMUdrop=%lu Frames/s=%lu | HostAge=%lu ms Paused=%u | SpO2=%s HR=%s\n",
                   negotiatedMTU, emg_available(), imu_available(),
+                  imuPresent ? "OK" : "N/A",
                   (unsigned long)emgDropped, (unsigned long)imuDropped,
                   (unsigned long)fps,
                   (unsigned long)hostAge, getSamplingPaused() ? 1 : 0,

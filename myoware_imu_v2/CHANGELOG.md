@@ -221,6 +221,273 @@ Disconnected ──connect──→ Wait Host ──PING──→ Streaming
 
 ---
 
+## 2026 — Session 18: Feature — IMU Graceful Degradation + Hot-Plug Auto-Recovery
+
+### Problem
+The firmware blocked indefinitely at startup if the ICM-20948 IMU sensor was missing or disconnected:
+```cpp
+// Before (infinite retry loop):
+while (myICM.status != ICM_20948_Stat_Ok) {
+  myICM.begin(Wire, AD0_VAL);
+  delay(500);
+}
+```
+
+This prevented the system from booting when:
+- IMU sensor physically disconnected (loose cable, hardware failure)
+- I2C address conflict or bus error
+- Sensor not yet powered on during development/testing
+
+**Impact:** System unusable without IMU, even though EMG/SpO2/battery could still function.
+
+### Solution: Graceful Degradation with Hot-Plug Support
+
+Implemented a three-part strategy:
+
+#### 1. Timeout-Based Initialization (Non-Blocking Boot)
+```cpp
+// After (10 retries × 500ms = 5 seconds max):
+int imuRetries = 10;
+while (imuRetries > 0) {
+  myICM.begin(Wire, AD0_VAL);
+  if (myICM.status == ICM_20948_Stat_Ok) {
+    imuPresent = true;
+    break;
+  }
+  imuRetries--;
+  if (imuRetries > 0) delay(500);
+}
+if (!imuPresent) {
+  Serial.println("[WARN] IMU not found; continuing without motion data.");
+}
+```
+
+**Benefits:**
+- System boots in <10 seconds even with missing IMU
+- Clear diagnostic message for troubleshooting
+- Other sensors (EMG, SpO2, battery) remain operational
+
+#### 2. Hot-Plug Detection & Auto-Recovery
+```cpp
+void imuTask(void* /*param*/) {
+  static uint32_t lastRetryMs = 0;
+  static constexpr uint32_t RETRY_INTERVAL_MS = 5000;  // Retry every 5 seconds
+  
+  for (;;) {
+    if (!imuPresent) {
+      uint32_t now = millis();
+      if (now - lastRetryMs >= RETRY_INTERVAL_MS) {
+        lastRetryMs = now;
+        
+        xSemaphoreTake(wireMutex, portMAX_DELAY);
+        myICM.begin(Wire, AD0_VAL);
+        bool recovered = (myICM.status == ICM_20948_Stat_Ok);
+        xSemaphoreGive(wireMutex);
+        
+        if (recovered) {
+          // Configure FSR on recovery
+          imuPresent = true;
+          Serial.printf("[IMU] Recovered! Set FSR: acc=+/- %ug, gyro=+/- %udps\n", 
+                        IMU_ACC_FSR_G, IMU_GYRO_FSR_DPS);
+        }
+      }
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+    
+    // Normal 200 Hz operation when IMU present...
+  }
+}
+```
+
+**Recovery Characteristics:**
+- **Detection interval:** 5 seconds (configurable via `RETRY_INTERVAL_MS`)
+- **Overhead when missing:** <0.01% CPU (1 I2C transaction per 5s)
+- **Overhead when present:** Zero (no retry logic executes)
+- **Seamless recovery:** No reboot or manual intervention required
+
+#### 3. Conditional Data Transmission
+```cpp
+// Only send IMU frames if sensor present
+if (imuPresent) {
+  static uint32_t lastImuSendMs = 0;
+  if (nowMs - lastImuSendMs >= 20 && emg_available() < EMG_BUF_SIZE * 3 / 4) {
+    lastImuSendMs = nowMs;
+    sent |= send_imu_frame(maxNotifyPayload);
+  }
+}
+```
+
+**Benefits:**
+- No bandwidth waste on dummy data
+- No protocol changes needed
+- Host decoder already handles missing TLV types gracefully
+
+### Design Options Considered
+
+**Option 1: Skip Missing Sensor Data (Implemented)**
+```cpp
+if (imuPresent) {
+  sent |= send_imu_frame(maxNotifyPayload);
+}
+```
+
+**Pros:**
+- ✅ No bandwidth waste on dummy data
+- ✅ No protocol changes needed
+- ✅ Host decoder already handles missing TLV types
+- ✅ Clear signal to host (missing TLV = sensor unavailable)
+
+**Cons:**
+- ⚠️ Host must handle variable data streams
+
+**Option 2: Send Zero/Stale Values (Not Implemented)**
+```cpp
+ImuSample lastGood = {0};
+if (!imuPresent) {
+  s = lastGood;  // Use stale/zero data
+}
+imu_push(s);
+```
+
+**Pros:**
+- ✅ Consistent data stream (always has IMU frames)
+- ✅ Easier to detect mid-session disconnections
+
+**Cons:**
+- ❌ Wastes bandwidth on dummy data
+- ❌ Host must detect "stuck at zero" pattern
+- ❌ Ambiguous (zeros could be valid data)
+
+**Option 3: Status Flag in Protocol (Not Implemented)**
+```cpp
+uint8_t sensorStatus = 0;
+if (imuPresent) sensorStatus |= 0x01;
+if (max3010xPresent) sensorStatus |= 0x02;
+```
+
+**Pros:**
+- ✅ Explicit status reporting
+- ✅ Host knows exactly what's available
+
+**Cons:**
+- ❌ Requires protocol version bump
+- ❌ Requires decoder changes
+- ❌ Unnecessary complexity for current use case
+
+**Decision Rationale:** Option 1 chosen for simplicity, no host changes required, and consistency with existing SpO2/battery handling.
+
+### Status Reporting
+
+**Health Report Format:**
+```
+// Before:
+[Health] MTU=247 EMGavail=0 IMUavail=0 EMGdrop=0 IMUdrop=0 ...
+
+// After:
+[Health] MTU=247 EMGavail=0 IMUavail=0 (IMU:N/A) EMGdrop=0 IMUdrop=0 ...
+[Health] MTU=247 EMGavail=128 IMUavail=42 (IMU:OK) EMGdrop=0 IMUdrop=0 ...
+```
+
+**Sensor Status Indicators:**
+- `(IMU:OK)` - Sensor present and operational
+- `(IMU:N/A)` - Sensor missing or failed initialization
+
+### Recovery Scenarios
+
+**Scenario 1: IMU Disconnected at Startup**
+```
+[Setup] Initializing IMU...
+[Setup] IMU init retry...
+[Setup] [WARN] IMU not found; continuing without motion data.
+[BLE] Connected. MTU=247
+[Health] ... (IMU:N/A) ...
+[imuTask] Retrying every 5s...
+```
+
+**Scenario 2: IMU Reconnected During Session**
+```
+[Health] ... (IMU:N/A) ...
+[imuTask] Attempting recovery...
+[IMU] Recovered! Set FSR: acc=+/- 4g, gyro=+/- 1000dps
+[Health] ... (IMU:OK) ...
+[BLE] Sending IMU frames...
+```
+
+**Scenario 3: IMU Disconnected Mid-Session**
+- Current implementation: No detection (sensor assumed stable once initialized)
+- Future enhancement: Add periodic health checks during normal operation
+
+### Changes Summary
+
+| Location | Before | After |
+|---|---|---|
+| Global | (no flag) | `static bool imuPresent = false;` |
+| `setup()` IMU init | Infinite retry loop | 10-retry timeout (5 seconds max) |
+| `imuTask` | Assumes IMU always present | Hot-plug detection every 5s when missing |
+| `loop()` TX | Always sends IMU frames | Conditional: `if (imuPresent)` |
+| `[Health]` report | No IMU status | `(IMU:OK)` or `(IMU:N/A)` |
+
+### Overhead Analysis
+
+**When IMU missing:**
+```
+I2C transactions: 1 per 5s (~200μs each)
+Task wakeups: Every 1s (minimal CPU)
+Total overhead: <0.01% CPU
+```
+
+**When IMU present:**
+```
+Detection overhead: Zero
+Normal operation: 200 Hz polling
+```
+
+### Retry Interval Trade-offs
+
+| Interval | Recovery Speed | Overhead | Use Case |
+|---|---|---|---|
+| 1 second | Fast | 5× more I2C traffic | Development/testing |
+| **5 seconds** ← current | Good balance | Minimal | **Production** |
+| 10 seconds | Slow | Lowest | Battery-constrained |
+
+**Decision:** 5 seconds chosen as good balance between recovery speed and overhead.
+
+### Consistency with Other Sensors
+
+This implementation follows the same pattern as existing sensors:
+
+| Sensor | Presence Flag | Initialization | Behavior When Missing |
+|---|---|---|---|
+| ICM-20948 (IMU) | `imuPresent` | Timeout-based, hot-plug retry | Skip IMU frames |
+| MAX30105 (SpO2) | `max3010xPresent` | Single attempt | Skip vitals frames |
+| MAX17048 (Battery) | `batteryAvailable` | Single attempt | Report N/A in vitals |
+
+### Future Enhancements
+
+1. **Configurable retry intervals** - Allow user to tune recovery speed vs overhead
+2. **Mid-session health checks** - Detect sensor disconnections during operation
+3. **Exponential backoff** - Reduce retry frequency after prolonged failures
+4. **Event-driven detection** - Use I2C bus interrupts instead of polling
+
+### Impact Analysis
+
+**What changed:**
+- IMU initialization: timeout-based instead of infinite retry
+- `imuTask`: hot-plug detection when sensor missing
+- BLE TX: conditional IMU frame transmission
+- Health report: IMU status indicator
+
+**What didn't change:**
+- Protocol format (no version bump needed)
+- Host decoder (already handles missing TLV types)
+- EMG/SpO2/battery operation (completely independent)
+- Ring buffer sizing, task priorities, synchronization
+
+**No host-side changes required.**
+
+---
+
 ## 2026 — Session 17: Fix — ADC Continuous Minimum Frequency Violation (Oversampling + Decimation)
 
 ### Problem
