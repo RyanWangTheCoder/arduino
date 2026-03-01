@@ -477,7 +477,7 @@ static void emg_adc_deinit() {
 
 // ==================== IMU timer ====================
 static void imu_timer_cb(void* /*arg*/) {
-  if (getSamplingPaused()) return;
+  // Always increment ticks - imuTask will check samplingPaused
   incrementImuTicks();
 }
 
@@ -621,7 +621,9 @@ void emgDrainTask(void* /*param*/) {
 // ==================== IMU Task ====================
 void imuTask(void* /*param*/) {
   static uint32_t lastRetryMs = 0;
+  static uint32_t lastHealthCheckMs = 0;
   static constexpr uint32_t RETRY_INTERVAL_MS = 5000;  // Retry every 5 seconds
+  static constexpr uint32_t HEALTH_CHECK_INTERVAL_MS = 5000;  // Health check every 5 seconds
   
   for (;;) {
     // Hot-plug detection: periodically retry if IMU not present
@@ -660,11 +662,38 @@ void imuTask(void* /*param*/) {
       continue;
     }
     
-    if (getImuTicks() > 0) {
+    // Periodic health check (runs even when paused to detect disconnections)
+    uint32_t now = millis();
+    if (now - lastHealthCheckMs >= HEALTH_CHECK_INTERVAL_MS) {
+      lastHealthCheckMs = now;
+      
+      xSemaphoreTake(wireMutex, portMAX_DELAY);
+      // Try a simple I2C read to check if sensor is still responding
+      myICM.getAGMT();  // This updates myICM.status
+      bool sensorOk = (myICM.status == ICM_20948_Stat_Ok);
+      xSemaphoreGive(wireMutex);
+      
+      if (!sensorOk) {
+        imuPresent = false;
+        Serial.println("[IMU] Disconnected! Sensor communication lost (health check).");
+      }
+    }
+    
+    // Normal sampling (only when not paused)
+    if (!getSamplingPaused() && getImuTicks() > 0) {
       decrementImuTicks();
       xSemaphoreTake(wireMutex, portMAX_DELAY);
       bool ready = myICM.dataReady();
       if (ready) myICM.getAGMT();
+      
+      // Check for sensor disconnection (I2C error during sampling)
+      if (myICM.status != ICM_20948_Stat_Ok) {
+        xSemaphoreGive(wireMutex);
+        imuPresent = false;
+        Serial.println("[IMU] Disconnected! Sensor communication lost.");
+        continue;
+      }
+      
       xSemaphoreGive(wireMutex);
       if (ready) {
         ImuSample s;
