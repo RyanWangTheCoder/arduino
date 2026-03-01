@@ -848,7 +848,7 @@ async def main() -> None:
         while True:
             await asyncio.sleep(float(args.ping_sec))
             try:
-                await client.write_gatt_char(NUS_RX_UUID, b"PING", response=False)
+                await client.write_gatt_char(NUS_RX_UUID, b"PING", response=True)
                 st.last_ping_ok_ms = now_ms()
             except Exception:
                 st.ping_fail += 1
@@ -893,7 +893,7 @@ async def main() -> None:
                     await client.start_notify(NUS_TX_UUID, on_notify)
                     # Kick device heartbeat
                     try:
-                        await client.write_gatt_char(NUS_RX_UUID, b"PING", response=False)
+                        await client.write_gatt_char(NUS_RX_UUID, b"PING", response=True)
                         st.last_ping_ok_ms = now_ms()
                     except Exception:
                         pass

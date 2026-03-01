@@ -725,28 +725,92 @@ static void configureMax3010x() {
 
 void spo2Task(void* /*param*/) {
   float hrAvg = 0;
+  static uint32_t lastRetryMs = 0;
+  static uint32_t lastHealthCheckMs = 0;
+  static constexpr uint32_t RETRY_INTERVAL_MS = 5000;  // Retry every 5 seconds
+  static constexpr uint32_t HEALTH_CHECK_INTERVAL_MS = 5000;  // Health check every 5 seconds
 
   for (;;) {
+    // Hot-plug detection: periodically retry if SpO2 sensor not present
     if (!max3010xPresent) {
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      uint32_t now = millis();
+      if (now - lastRetryMs >= RETRY_INTERVAL_MS) {
+        lastRetryMs = now;
+        
+        xSemaphoreTake(wireMutex, portMAX_DELAY);
+        bool recovered = maxSensor.begin(Wire, I2C_SPEED_FAST, MAX3010X_ADDR);
+        xSemaphoreGive(wireMutex);
+        
+        if (recovered) {
+          xSemaphoreTake(wireMutex, portMAX_DELAY);
+          configureMax3010x();
+          xSemaphoreGive(wireMutex);
+          
+          max3010xPresent = true;
+          Serial.println("[SpO2] Recovered! MAX30105 sensor reconnected.");
+        }
+      }
+      vTaskDelay(1000 / portTICK_PERIOD_MS);  // Check every second
       continue;
+    }
+    
+    // Periodic health check (runs even during normal operation to detect disconnections)
+    uint32_t now = millis();
+    if (now - lastHealthCheckMs >= HEALTH_CHECK_INTERVAL_MS) {
+      lastHealthCheckMs = now;
+      
+      xSemaphoreTake(wireMutex, portMAX_DELAY);
+      // Try a simple I2C read to check if sensor is still responding
+      maxSensor.check();
+      // MAX30105 library doesn't expose status like ICM-20948, so we check if we can read
+      uint32_t testRead = maxSensor.getIR();
+      xSemaphoreGive(wireMutex);
+      
+      // If IR reading is 0, sensor may be disconnected (or finger removed, but that's OK)
+      // We'll rely on the sample collection loop to detect actual I2C failures
     }
 
     // Collect 100 samples (~4 sec at 25 Hz)
+    bool collectionFailed = false;
     for (int i = 0; i < SPO2_BUFFER_SIZE; i++) {
       bool avail = false;
-      while (!avail) {
+      int retries = 0;
+      while (!avail && retries < 100) {  // Add retry limit to detect I2C failures
         xSemaphoreTake(wireMutex, portMAX_DELAY);
         maxSensor.check();
         avail = maxSensor.available();
         xSemaphoreGive(wireMutex);
-        if (!avail) vTaskDelay(1);
+        if (!avail) {
+          vTaskDelay(1);
+          retries++;
+        }
       }
+      
+      if (retries >= 100) {
+        // Sensor not responding - likely disconnected
+        max3010xPresent = false;
+        
+        // Invalidate vitals to prevent stale data from being displayed
+        portENTER_CRITICAL(&vitalsMux);
+        vitals.spo2_u16 = 0xFFFF;    // Mark as invalid
+        vitals.hr_x10_u16 = 0xFFFF;  // Mark as invalid
+        vitals.flags = 0;            // Clear validity flags
+        portEXIT_CRITICAL(&vitalsMux);
+        
+        Serial.println("[SpO2] Disconnected! Sensor not responding during sample collection.");
+        collectionFailed = true;
+        break;
+      }
+      
       xSemaphoreTake(wireMutex, portMAX_DELAY);
       redBuffer[i] = maxSensor.getRed();
       irBuffer[i]  = maxSensor.getIR();
       maxSensor.nextSample();
       xSemaphoreGive(wireMutex);
+    }
+    
+    if (collectionFailed) {
+      continue;  // Skip computation, go back to recovery mode
     }
 
     uint32_t lastIR  = irBuffer[SPO2_BUFFER_SIZE - 1];
