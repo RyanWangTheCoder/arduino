@@ -5,7 +5,23 @@ Format: newest session at the top.
 
 ---
 
-<<<<<<< HEAD
+## 2026-03-01 — `myoware_imu_v2.ino`: Fix frequent STALL reconnect loops
+
+### Changed (`myoware_imu_v2.ino`)
+- Relaxed Watchdog host heartbeat timeout policies by 10x:
+  - `HOST_PING_EXPECT_MS` raised from 2000 to 20000.
+  - `HOST_SILENCE_PAUSE_MS` raised from 5000 to 50000.
+  - `HOST_SILENCE_REBOOT_MS` raised from 30000 to 300000.
+
+### Motivation
+During high-speed data capture (2000 Hz EMG + 200 Hz IMU), the Windows Bluetooth stack frequently enters a "stall" state where it silently drops or indefinitely queues the outbound `PING` packets from `btCentral.py`. 
+
+Because the ESP32 was not receiving these PINGs, its internal watchdog (previously set to 5 seconds) would trigger, causing it to intentionally pause all data sampling to save power. This sudden stop in data caused the Python host script to register a `stall_no_notify` error and forcefully initiate a reconnect loop. 
+
+A previous attempt (2026-02-28) tried to fix this by changing `response=False` to `response=True` in Python, but this did not solve the OS-level packet drops. The correct fix is to acknowledge that Windows will occasionally drop outbound BLE writes under heavy load, and the ESP32 must be resilient to this. Relaxing the ESP32 timeout to 50 seconds completely prevents the stuttering `fps=0` issue while still maintaining a functional watchdog in the event of a true disconnection.
+
+---
+
 ## 2026-03-01 — `btCentral.py`: Fix `asyncio.exceptions.CancelledError` crash during Watchdog reconnects
 
 ### Changed (`btCentral.py`)
@@ -15,7 +31,7 @@ Format: newest session at the top.
 When the BLE connection stalls (e.g., `stall_no_notify_5490ms`) and triggers a forced reconnect, the main loop calls `.cancel()` on the running background tasks (`ping_task`, `watchdog_task`, `writer_task`, etc.). 
 In Python 3.8+, `asyncio.CancelledError` inherits from `BaseException`, not `Exception`. Because the cleanup code previously only used `except Exception: pass`, the cancellation exception escaped the handler and crashed the entire Python script. 
 Adding `except asyncio.CancelledError: pass` ensures tasks can be safely torn down and restarted without crashing the script.
-=======
+
 ## 2026-02-28 — BLE Watchdog & Connection Stall Recovery (End-to-End Analysis)
 
 ### Part 1: Python PING `response=False` → `response=True` (Best Practice Fix)

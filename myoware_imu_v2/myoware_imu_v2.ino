@@ -34,9 +34,9 @@ static const char* DEVICE_NAME = "MyoW1";
 static constexpr int PIN_LED = 13;  // MyoWare Wireless Shield "User LED (13)" (verified)
 
 // Host heartbeat policy
-static constexpr uint32_t HOST_PING_EXPECT_MS      = 2000;  // host sends PING ~1s; warn if >2s
-static constexpr uint32_t HOST_SILENCE_PAUSE_MS    = 5000;  // pause streaming/sampling if >5s
-static constexpr uint32_t HOST_SILENCE_REBOOT_MS   = 30000; // reboot if >30s
+static constexpr uint32_t HOST_PING_EXPECT_MS      = 20000;  // host sends PING ~1s; warn if >20s
+static constexpr uint32_t HOST_SILENCE_PAUSE_MS    = 50000;  // pause streaming/sampling if >50s
+static constexpr uint32_t HOST_SILENCE_REBOOT_MS   = 300000; // reboot if >300s
 
 // TX backlog policy
 static constexpr uint16_t EMG_BACKLOG_PAUSE_THRESH = 1800; // indicate backlog if EMG backlog too high (approx)
