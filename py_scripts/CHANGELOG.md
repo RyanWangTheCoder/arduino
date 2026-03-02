@@ -5,6 +5,18 @@ Format: newest session at the top.
 
 ---
 
+## 2026-03-01 — `btCentral.py`: Fix `asyncio.exceptions.CancelledError` crash during Watchdog reconnects
+
+### Changed (`btCentral.py`)
+- Explicitly catch `asyncio.CancelledError` inside the main event loop's task-cleanup `finally` blocks (lines 923-927 and 971-975).
+
+### Motivation
+When the BLE connection stalls (e.g., `stall_no_notify_5490ms`) and triggers a forced reconnect, the main loop calls `.cancel()` on the running background tasks (`ping_task`, `watchdog_task`, `writer_task`, etc.). 
+In Python 3.8+, `asyncio.CancelledError` inherits from `BaseException`, not `Exception`. Because the cleanup code previously only used `except Exception: pass`, the cancellation exception escaped the handler and crashed the entire Python script. 
+Adding `except asyncio.CancelledError: pass` ensures tasks can be safely torn down and restarted without crashing the script.
+
+---
+
 ## 2026-02-25 — `btCentral.py`: IMU FSR fallback defaults raised (gyro 250→1000 dps, acc 2→4 g)
 
 ### Changed (`btCentral.py`)

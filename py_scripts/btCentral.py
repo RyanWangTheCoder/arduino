@@ -923,6 +923,8 @@ async def main() -> None:
                             t.cancel()
                             try:
                                 await t
+                            except asyncio.CancelledError:
+                                pass
                             except Exception:
                                 pass
 
@@ -971,6 +973,8 @@ async def main() -> None:
             t.cancel()
             try:
                 await t
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
 
