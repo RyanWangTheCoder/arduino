@@ -51,21 +51,47 @@ Because `emg_util.py` ignores the hardware `ENV` column and relies entirely on t
 ### Step 2: The Hardwire Bypass (If Pogo Pins Fail)
 If the pogo pins are damaged or unreliable during active sports/movement, you must bypass them with a hardwired connection:
 1. Locate the **RAW** PTH pad on the MyoWare Muscle Sensor board.
-2. Locate the **A4** (Pin 32) PTH pad on the Wireless Shield.
+2. Locate the pad labeled **`32`** on the underside of the Wireless Shield.
 3. **Solder a flexible jumper wire** directly between these two pads.
 
-### Why A4? (Firmware Proof)
-The requirement to wire to pad `A4` specifically is hardcoded in the `myoware_imu_v2.ino` firmware. 
-
-At the top of the sketch (around line 40), the pin mappings are explicitly defined:
+### The "A4" Naming Trap
+The original firmware code comments incorrectly assumed that the pad labeled "A4" on the shield routed to ESP32 GPIO 32:
 ```cpp
 // ==================== EMG Pins ====================
 static constexpr int PIN_ENV = 39; // A3 (ADC1)
-static constexpr int PIN_RAW = 32; // A4 (ADC1)
-static constexpr int PIN_REF = 33; // A5 (ADC1)
-static constexpr bool REF_CONNECTED = false;
+static constexpr int PIN_RAW = 32; // A4 (ADC1) - THIS COMMENT WAS WRONG!
 ```
-This tells the ESP32 that the `RAW` data is expected on `Pin 32`, which corresponds to pad `A4` on the Wireless Shield.
+On original Arduino Uno boards, A4 is the I2C SDA pin. To maintain compatibility with Uno shields, SparkFun routed the ESP32's actual I2C SDA pin (**GPIO 21**) to the hole labeled "A4". GPIO 21 is strictly a digital pin and has no ADC capabilities.
+
+Because the code was listening to GPIO 32, but the physical wire was soldered to the digital I2C bus (A4), the ESP32 ADC was reading a floating pin.
+
+### How We Debugged It (The "Finger Touch" Test)
+To prove the physical disconnect, a tiny diagnostic Arduino sketch was flashed to the ESP32 to print the values of all ADC1 channels to the Serial Monitor:
+```cpp
+void setup() { Serial.begin(115200); }
+void loop() {
+  Serial.print("Pin36:"); Serial.print(analogRead(36)); Serial.print("\t");
+  Serial.print("Pin37:"); Serial.print(analogRead(37)); Serial.print("\t");
+  Serial.print("Pin39(ENV):"); Serial.print(analogRead(39)); Serial.print("\t");
+  Serial.print("Pin32:"); Serial.print(analogRead(32)); Serial.print("\t");
+  Serial.print("Pin33:"); Serial.print(analogRead(33)); Serial.println();
+  delay(100);
+}
+```
+While running this script, the user physically touched the "A4" pad with their bare finger. Because the human body acts as an antenna for 60Hz mains noise, touching an active ADC pin causes the readings to swing wildly (0 to 4095). **Touching A4 produced no change**, proving it was not connected to any of the ADC pins being scanned. Touching the pad explicitly labeled `32` on the back of the shield caused massive fluctuations, confirming the correct routing.
+
+### The "Ghost" Signal & ADC Crosstalk
+During the period where the RAW pin was floating, the CSV logs showed the `raw` column maintaining a constant ~37% to ~44% ratio relative to the `env` column, with a correlation of 0.998. 
+
+**Why does RAW mirror ENV if it is disconnected?**
+This is caused by **ADC Multiplexer Charge Sharing (Crosstalk)**. The ESP32 ADC Continuous (DMA) mode switches channels at 40 kHz. The internal Sample-and-Hold (S/H) capacitor charges to the actively driven `ENV` voltage (GPIO 39). When the multiplexer switches to the floating `RAW` pin (GPIO 32), the pin has no driving source. The charge is distributed between the S/H capacitor and the parasitic capacitance of the floating pin/trace, resulting in a predictable fractional voltage drop (the ~40% ghost signal). 
+
+Because this ghost signal is just a slow DC-like trace, when the Python script passes it through `preprocess_emg` (which applies a high-pass filter to block DC noise), the ghost signal gets completely wiped out, resulting in a flatline.
+
+### Final Verification
+After moving the solder wire to the correct pad (`32`), the `raw` signal finally showed true, independent, high-frequency AC oscillation. 
+
+To visualize this properly in the real-time Python plotter, a `--raw-zoom` flag was added to `sensordata_plotter.py`. The MyoWare sensor centers the resting RAW signal at ~1.65V (1800-2048 counts). The `--raw-zoom` flag dynamically zooms the Y-axis to perfectly track the baseline noise, allowing the user to clearly see the high-frequency bursts of muscle noise bulging outward exactly in sync with the hardware envelope.
 
 Further down, the firmware configures the hardware Direct Memory Access (DMA) to capture high-speed data from `ADC1 channel 4` (which maps to Pin 32):
 ```cpp

@@ -379,7 +379,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--address-type", choices=["public", "random"], default=None)
 
     # Watchdog / keepalive
-    ap.add_argument("--ping-sec", type=float, default=1.0)
+    ap.add_argument("--ping-sec", type=float, default=5.0)
     ap.add_argument("--stall-warn-ms", type=int, default=2000)
     ap.add_argument("--stall-reconnect-ms", type=int, default=5000)
     ap.add_argument("--max-backoff-sec", type=float, default=20.0)
@@ -859,19 +859,13 @@ async def main() -> None:
             age = now_ms() - st.last_notify_ms
             if age > int(args.stall_reconnect_ms):
                 st.last_reconnect_reason = f"stall_no_notify_{age}ms"
-                # resubscribe once
-                try:
-                    await client.stop_notify(NUS_TX_UUID)
-                    await asyncio.sleep(0.1)
-                    await client.start_notify(NUS_TX_UUID, on_notify)
-                    st.last_reconnect_reason = f"resubscribe_attempted_{age}ms"
-                    await asyncio.sleep(1.0)
-                except Exception:
-                    pass
-                if (now_ms() - st.last_notify_ms) > int(args.stall_reconnect_ms):
-                    st.last_reconnect_reason = f"reconnect_after_resub_{now_ms() - st.last_notify_ms}ms"
-                    reconnect_evt.set()
-                    return
+                reconnect_evt.set()
+                return
+
+    def handle_disconnect(client: BleakClient) -> None:
+        if st.subscribed:
+            st.last_reconnect_reason = "disconnect_event"
+            loop.call_soon_threadsafe(reconnect_evt.set)
 
     print(f"[BLE] Connecting to {device.address}...")
 
@@ -883,7 +877,7 @@ async def main() -> None:
             reconnect_evt.clear()
 
             try:
-                async with BleakClient(device, timeout=float(args.timeout), services=[NUS_SERVICE_UUID], winrt=winrt_args) as client:
+                async with BleakClient(device, timeout=float(args.timeout), services=[NUS_SERVICE_UUID], winrt=winrt_args, disconnected_callback=handle_disconnect) as client:
                     try:
                         await client.request_mtu(247)
                     except Exception:
@@ -916,7 +910,7 @@ async def main() -> None:
                     finally:
                         st.subscribed = False
                         try:
-                            await client.stop_notify(NUS_TX_UUID)
+                            await asyncio.wait_for(client.stop_notify(NUS_TX_UUID), timeout=2.0)
                         except Exception:
                             pass
                         for t in (ping_t, wd_t):
@@ -960,6 +954,12 @@ async def main() -> None:
 
                 # Also reset frame-gap tracking so gap stats are not polluted by the reset.
                 st.last_frame_seq = None
+
+                # Force emg_meta to be re-sent on the next connection so the plotter
+                # (sensordata_plotter.py) re-initialises its LPF and timebase.
+                # Without this, the plotter never receives the sample-rate packet after
+                # a reconnect because consumer_task only sends emg_meta when sr_hz changes.
+                st.last_emg_sr_hz = 0
 
 
 

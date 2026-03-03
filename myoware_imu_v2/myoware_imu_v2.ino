@@ -34,9 +34,9 @@ static const char* DEVICE_NAME = "MyoW1";
 static constexpr int PIN_LED = 13;  // MyoWare Wireless Shield "User LED (13)" (verified)
 
 // Host heartbeat policy
-static constexpr uint32_t HOST_PING_EXPECT_MS      = 20000;  // host sends PING ~1s; warn if >20s
-static constexpr uint32_t HOST_SILENCE_PAUSE_MS    = 50000;  // pause streaming/sampling if >50s
-static constexpr uint32_t HOST_SILENCE_REBOOT_MS   = 300000; // reboot if >300s
+static constexpr uint32_t HOST_PING_EXPECT_MS      = 12000;  // host sends PING ~5s; warn if >12s
+static constexpr uint32_t HOST_SILENCE_PAUSE_MS    = 18000;  // pause streaming/sampling if >18s
+static constexpr uint32_t HOST_SILENCE_REBOOT_MS   = 30000;  // reboot if >30s
 
 // TX backlog policy
 static constexpr uint16_t EMG_BACKLOG_PAUSE_THRESH = 1800; // indicate backlog if EMG backlog too high (approx)
@@ -1466,9 +1466,29 @@ void loop() {
 
   // ---- TX loop ----
   if (isConnected && pTXCharacteristic && !getSamplingPaused()) {
+    // Refresh maxNotifyPayload from the current negotiated MTU.
+    // onConnect() captures getMTU() before the central has a chance to
+    // negotiate a larger MTU, so the value there is often still 23 (→ 20 bytes
+    // usable), which is too small for any of our frames.  Re-reading it here
+    // picks up the post-negotiation value (typically 247 → 244 bytes usable).
+    uint16_t curMTU = BLEDevice::getMTU();
+    if (curMTU > 3) {
+      maxNotifyPayload = curMTU - 3;
+    }
+
     bool sent = false;
 
-    sent |= send_emg_frame(maxNotifyPayload);
+    // Rate-limit EMG frames to ≤50 Hz (one frame per 20 ms).
+    // At 2000 Hz EMG, 20 ms accumulates ~40 samples; with MTU=247 we can fit
+    // up to 53 samples per frame, so we always drain the backlog in one shot.
+    // Sending at 400 Hz (every 2.5 ms) overflows the ESP32 BLE stack's
+    // notification queue (~3-5 slots at a 30 ms connection interval), causing
+    // silent notification drops and the "one frame then stall" symptom.
+    static uint32_t lastEmgSendMs = 0;
+    if (nowMs - lastEmgSendMs >= 20) {
+      lastEmgSendMs = nowMs;
+      sent |= send_emg_frame(maxNotifyPayload);
+    }
 
     // Only send IMU frames if IMU sensor is present
     if (imuPresent) {

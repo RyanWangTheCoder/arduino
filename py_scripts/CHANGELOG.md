@@ -5,6 +5,28 @@ Format: newest session at the top.
 
 ---
 
+## 2026-03-02 — `btCentral.py`: Fix excessive reconnects and handle ESP32 brown-outs
+
+### Changed (`btCentral.py`)
+- Increased PING interval (`--ping-sec`) default from 1.0s to 5.0s to reduce unnecessary BLE traffic.
+- Removed the `resub_attempted` logic from `watchdog_task`. It now immediately triggers a reconnect when the 5-second stall timeout is reached.
+- Added a `disconnected_callback` (`handle_disconnect`) to the `BleakClient` initialization to trigger an immediate reconnect when the OS detects a dropped connection.
+- Wrapped `client.stop_notify()` inside the `finally` cleanup block with `asyncio.wait_for(..., timeout=2.0)` to prevent the script from hanging indefinitely when tearing down a dead connection.
+
+### Motivation & Root Cause Analysis
+Users observed frequent reconnects with the reason `reconnect_after_resub_9605ms` when running the ESP32 on battery power, but the connection was stable when plugged into USB-C. Furthermore, the ESP32 LED was observed turning off and back on during these events.
+
+**Root Cause:**
+The ESP32 was experiencing **Brown-Out Resets (BOD)**. During BLE transmission spikes, the ESP32 can draw 300-500mA. On battery power (if the battery is weak or wiring has high resistance), this current spike caused the voltage to momentarily dip below ~2.8V, triggering a hardware reset. 
+
+**Why it caused 9-second hangs in Python:**
+When the ESP32 suddenly lost power and reset, the Windows BLE stack did not immediately fire a disconnect event. The Python `watchdog_task` correctly detected the silence after 5 seconds (`stall_reconnect_ms`). However, the script then attempted to `stop_notify` and `start_notify` to "resubscribe". Because the physical connection was dead, these WinRT BLE operations hung and eventually timed out 4 seconds later (totaling 9+ seconds of silence). 
+
+**The Fix:**
+By adding a proper `disconnected_callback` and simplifying the watchdog to force an immediate reconnect (skipping the doomed resubscribe attempts), the script now recovers almost instantly when the ESP32 reboots. Additionally, wrapping `stop_notify` in a timeout ensures the cleanup phase doesn't hang. While the true fix for the brown-out is hardware-based (better battery, shorter wires, or decoupling capacitors), the software is now highly resilient and recovers from device resets in ~1-2 seconds.
+
+---
+
 ## 2026-03-01 — `myoware_imu_v2.ino`: Fix frequent STALL reconnect loops
 
 ### Changed (`myoware_imu_v2.ino`)

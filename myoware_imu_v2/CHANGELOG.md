@@ -1,7 +1,21 @@
 # MyoWare IMU v2 — Changelog
 
-All notable changes to `myoware_imu_v2.ino` are documented here.  
+All notable changes to `myoware_imu_v2.ino` are documented here.
 Format: newest session at the top.
+
+---
+
+## 2026-03-02 — Revert Massive Watchdog Timeouts (Brown-out Discovery)
+
+### Changed
+- Reverted the 10x relaxed watchdog timeouts to more reasonable values aligned with the new 5-second host PING interval:
+  - `HOST_PING_EXPECT_MS`: 20000 → 12000 (12s)
+  - `HOST_SILENCE_PAUSE_MS`: 50000 → 18000 (18s)
+  - `HOST_SILENCE_REBOOT_MS`: 300000 → 30000 (30s)
+
+### Motivation
+It was discovered that the frequent "BLE stalls" that led to the timeouts being massively increased (on 2026-03-01) were actually caused by **ESP32 Brown-out Resets (BOD)** on battery power, not by the Windows WinRT BLE stack silently dropping PINGs. 
+Because the ESP32 was physically resetting due to current spikes during BLE transmission, increasing the software timeouts did not solve the root cause, and just made genuine software-level recovery much slower. The timeouts have been reverted to shorter durations to ensure the watchdog acts quickly when a genuine software stall or host crash occurs.
 
 ---
 
@@ -218,6 +232,166 @@ Disconnected ──connect──→ Wait Host ──PING──→ Streaming
 | `LED_STREAMING` | Solid ON | Streaming data to host |
 | `LED_BACKLOG` | Fast blink (16 Hz) | Ring buffer backlog high (MTU too low) |
 | `LED_LOW_BATTERY` | Very fast blink (10 Hz) | Battery < 20% |
+
+---
+
+## 2026 — Session 19: Fix — BLE Stall After Reconnect (MTU Race + Notification Queue Overflow)
+
+### Problem
+After a BLE reconnect, the device would send exactly one notification burst then stall
+completely. The Python health log showed:
+
+```
+state=OK  fps=0 notify/s=0  last_notify=225ms last_good=225ms  ping_age=318ms ping_fail=1  recon=1
+state=OK  fps=0 notify/s=0  last_notify=1233ms ...
+state=WARN ...
+state=STALL ...
+[BLE] Reconnecting in 0.5s (reason=reconnect_after_resub_9614ms)
+```
+
+Two root causes were identified.
+
+---
+
+### Root Cause 1: `maxNotifyPayload` Set Before MTU Negotiation
+
+`onConnect()` captures the MTU immediately:
+```cpp
+negotiatedMTU    = BLEDevice::getMTU();
+maxNotifyPayload = (negotiatedMTU > 3) ? (negotiatedMTU - 3) : 20;
+```
+
+BLE MTU negotiation happens **after** the connection event. At the time `onConnect()` fires,
+`BLEDevice::getMTU()` still returns the default 23, giving `maxNotifyPayload = 20`.
+
+All three send functions require more than 20 bytes of payload:
+
+| Function | Min bytes needed | With `maxNotifyPayload=20` |
+|---|---|---|
+| `send_emg_frame()` | 36 | Returns `false` immediately |
+| `send_imu_frame()` | 45 | Returns `false` immediately |
+| `send_vitals_frame()` | 30 | Returns `false` immediately |
+
+Result: the device sends **nothing** after reconnect until the MTU is somehow refreshed.
+The one notification seen in the log came from the previous connection's cached MTU value
+(some ESP32 BLE stack versions remember the last negotiated MTU across reconnects).
+
+---
+
+### Root Cause 2: BLE Notification Queue Overflow
+
+The TX loop ran every 1 ms and called `send_emg_frame()` whenever ≥5 samples were
+buffered — approximately every 2.5 ms (400 Hz). The ESP32 BLE stack's internal
+notification queue holds only 3–5 packets. At a typical Windows BLE connection interval
+of 30 ms, the stack can drain ~1 packet per interval. The device was queuing 12 packets
+per interval (30 ms / 2.5 ms), overflowing the queue.
+
+When the queue is full, `esp_ble_gatts_send_indicate()` (called internally by `notify()`)
+returns `ESP_ERR_NO_MEM`. The Arduino BLE wrapper ignores this error code — notifications
+are silently dropped. The Python side receives the first packet (before the queue fills),
+then nothing.
+
+---
+
+### Root Cause 3: `emg_meta` Not Resent After Reconnect (`btCentral.py`)
+
+`consumer_task` only sends the `emg_meta` UDP packet when `sr_hz` changes:
+```python
+if sr_hz and int(sr_hz) != int(st.last_emg_sr_hz):
+    udp_send(st, {"k": "emg_meta", ...})
+```
+
+After reconnect, `last_emg_sr_hz` still held the previous session's value. The plotter
+(`sensordata_plotter.py`) never received the sample-rate packet needed to reinitialise
+its Butterworth LPF and device-time timebase.
+
+---
+
+### Fix 1: Dynamic `maxNotifyPayload` in TX Loop (`myoware_imu_v2.ino`)
+
+Re-read the current MTU at the start of every TX loop iteration:
+
+```cpp
+// Refresh maxNotifyPayload from the current negotiated MTU.
+// onConnect() captures getMTU() before the central has a chance to
+// negotiate a larger MTU, so the value there is often still 23 (→ 20 bytes
+// usable), which is too small for any of our frames.  Re-reading it here
+// picks up the post-negotiation value (typically 247 → 244 bytes usable).
+uint16_t curMTU = BLEDevice::getMTU();
+if (curMTU > 3) {
+    maxNotifyPayload = curMTU - 3;
+}
+```
+
+This is a one-liner that costs nothing and ensures the correct MTU is always used,
+regardless of when the central completes MTU negotiation relative to `onConnect()`.
+
+---
+
+### Fix 2: EMG Frame Rate Limiter (`myoware_imu_v2.ino`)
+
+Added a 20 ms minimum interval between EMG frame sends (≤50 Hz):
+
+```cpp
+// Rate-limit EMG frames to ≤50 Hz (one frame per 20 ms).
+// At 2000 Hz EMG, 20 ms accumulates ~40 samples; with MTU=247 we can fit
+// up to 53 samples per frame, so we always drain the backlog in one shot.
+// Sending at 400 Hz (every 2.5 ms) overflows the ESP32 BLE stack's
+// notification queue (~3-5 slots at a 30 ms connection interval), causing
+// silent notification drops and the "one frame then stall" symptom.
+static uint32_t lastEmgSendMs = 0;
+if (nowMs - lastEmgSendMs >= 20) {
+    lastEmgSendMs = nowMs;
+    sent |= send_emg_frame(maxNotifyPayload);
+}
+```
+
+**Throughput analysis:**
+
+| Parameter | Value |
+|---|---|
+| EMG rate | 2000 Hz |
+| Frame interval | 20 ms |
+| Samples accumulated per interval | ~40 |
+| Max samples per MTU-247 frame | (244 − 32) / 4 = 53 |
+| Frames per second | 50 |
+| Effective throughput | 50 × 40 = 2000 samples/s ✓ |
+
+Total notification rate (EMG 50 Hz + IMU 50 Hz) = 100 Hz.
+At 30 ms connection interval: ~3 notifications per interval — within the queue limit.
+
+---
+
+### Fix 3: Reset `last_emg_sr_hz` on Reconnect (`btCentral.py`)
+
+In the reconnect exception handler, reset `last_emg_sr_hz` to 0 so the next
+`TLV_EMG_BATCH` frame triggers an `emg_meta` UDP send regardless of whether the
+sample rate changed:
+
+```python
+# Force emg_meta to be re-sent on the next connection so the plotter
+# (sensordata_plotter.py) re-initialises its LPF and timebase.
+# Without this, the plotter never receives the sample-rate packet after
+# a reconnect because consumer_task only sends emg_meta when sr_hz changes.
+st.last_emg_sr_hz = 0
+```
+
+---
+
+### Changes Summary
+
+| File | Location | Change |
+|---|---|---|
+| `myoware_imu_v2.ino` | `loop()` TX block | Re-read `BLEDevice::getMTU()` each iteration; update `maxNotifyPayload` |
+| `myoware_imu_v2.ino` | `loop()` TX block | Rate-limit EMG sends to ≤50 Hz via `lastEmgSendMs` (20 ms gate) |
+| `btCentral.py` | Reconnect exception handler | `st.last_emg_sr_hz = 0` to force `emg_meta` resend |
+
+### What Did Not Change
+- Protocol format, frame structure, CRC — unchanged
+- `send_emg_frame()` internals — unchanged (still batches all available samples)
+- IMU send rate — already gated at 20 ms; no change needed
+- Vitals send rate — already gated at 30 s; no change needed
+- `onConnect()` MTU capture — kept as-is (now just an initial hint, overridden in TX loop)
 
 ---
 
