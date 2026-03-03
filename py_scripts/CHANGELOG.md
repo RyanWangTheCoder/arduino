@@ -5,6 +5,42 @@ Format: newest session at the top.
 
 ---
 
+## 2026-03-02 — Root Cause Identified: BLE STALLs were caused by wrong hardware pad (I2C SDA bus corruption)
+
+### Root Cause Analysis (Retrospective)
+
+The frequent BLE reconnects and `state=STALL` events observed in early March 2026 were ultimately traced to a **hardware wiring error**, not a software bug.
+
+**The wrong pad:**
+The jumper wire bypassing the broken pogo pin was soldered to the pad labeled **"A4"** on the SparkFun Wireless Shield. Due to Arduino Uno pin-compatibility routing, this pad is connected to **GPIO 21 (ESP32 I2C SDA)**, not to an ADC pin. The firmware was reading GPIO 32 (ADC1 channel 4) for RAW EMG data, so the ADC was floating and the wire was injecting the MyoWare RAW analog signal directly onto the **I2C bus**.
+
+**Why this caused BLE STALLs:**
+The MyoWare RAW output is a low-impedance analog signal that swings between 0V and 3.3V at muscle frequencies (20–500 Hz). I2C SDA is an open-drain bus with a pull-up resistor (~4.7kΩ). When the RAW signal drove SDA **LOW** during a muscle flex, the ESP32 I2C peripheral saw a **stuck-low SDA** — a classic I2C bus lockup. The cascade:
+
+1. RAW EMG signal drives I2C SDA low during muscle flex
+2. ESP32 I2C peripheral hangs waiting for SDA to go HIGH (never does while muscle is active)
+3. IMU read task blocks indefinitely on the stuck I2C bus
+4. No new IMU data → no new BLE notification packets
+5. Health monitor sees `fps=0` → `state=STALL` → triggers reconnect
+
+This explains the health log pattern exactly:
+```
+fps=102  ← normal, muscle at rest, RAW near 1.65V DC (not driving SDA low hard enough)
+fps=99
+fps=6    ← user starts flexing, RAW starts swinging, I2C getting corrupted
+fps=0    ← I2C bus locked up, IMU task hung
+state=STALL → reconnect
+```
+The reconnect "fixed" it temporarily because the ESP32 re-initialized, clearing the I2C lockup. But as soon as the muscle flexed again, the same thing happened.
+
+**The actual fix:**
+Moved the solder wire from the "A4" pad (GPIO 21, I2C SDA) to the pad explicitly labeled **`32`** on the back of the Wireless Shield (GPIO 32, ADC1 channel 4). This is the pin the firmware was already reading. See `myoware_imu_v2/WIRING.md` for the full debug process (finger-touch test, ADC crosstalk ghost signal analysis, and final verification).
+
+**Note on the btCentral.py software changes (same date):**
+The reconnect logic improvements (removing resubscribe, adding `disconnected_callback`, wrapping `stop_notify` in a timeout) were made before the hardware root cause was identified. They remain valid improvements — they make the software more resilient to any future hardware or BLE stack issues — but they were treating the symptom, not the cause.
+
+---
+
 ## 2026-03-02 — `btCentral.py`: Fix excessive reconnects and handle ESP32 brown-outs
 
 ### Changed (`btCentral.py`)
