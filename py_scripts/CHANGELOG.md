@@ -1,7 +1,46 @@
 # Changelog (host scripts)
 
-All notable changes to host-side scripts are documented here.
-Format: newest session at the top.
+---
+
+## [2026-03-03] — Fix: fast reconnect for stall/disconnect (`btCentral.py`)
+
+### Problem
+After `recon=10` reconnects, exponential backoff reached `min(20, 0.5 × 2^10) = 20 seconds`.
+The device was previously connected and still advertising, but the code waited 20s before
+retrying — causing ~25s of data loss per stall event (5s stall detection + 20s backoff).
+
+### Fix
+Distinguish reconnect trigger type in the exception handler.
+
+**Transient failures** (device nearby, likely mid-reboot): **1s fixed delay**, backoff reset to 0.5:
+- `stall_*` — watchdog detected silence, device still advertising
+- `disconnect_event` — OS fired disconnect callback
+- `TimeoutError` — BLE connect timed out (device mid-reboot, not truly out of range)
+
+**Unexpected OS/stack errors**: keep exponential backoff up to `--max-backoff-sec` (default 20s).
+
+```python
+is_transient = (
+    reason.startswith("stall_")
+    or reason == "disconnect_event"
+    or "TimeoutError" in reason
+)
+if is_transient:
+    sleep_s = 1.0
+    backoff = 0.5
+else:
+    sleep_s = min(float(args.max_backoff_sec), backoff)
+    backoff = min(float(args.max_backoff_sec), backoff * 2.0)
+```
+
+### Expected result
+```
+[Health] state=STALL ... reason=stall_no_notify_5258ms
+[BLE] Reconnecting in 1.0s (reason=stall_no_notify_5258ms)   ← was 20s
+[BLE] Subscribing...
+[BLE] Recording...
+```
+Total downtime per stall: ~6s (5s detection + 1s delay) instead of ~25s.
 
 ---
 
@@ -12,7 +51,7 @@ Format: newest session at the top.
 The frequent BLE reconnects and `state=STALL` events observed in early March 2026 were ultimately traced to a **hardware wiring error**, not a software bug.
 
 **The wrong pad:**
-The jumper wire bypassing the broken pogo pin was soldered to the pad labeled **"A4"** on the SparkFun Wireless Shield. Due to Arduino Uno pin-compatibility routing, this pad is connected to **GPIO 21 (ESP32 I2C SDA)**, not to an ADC pin. The firmware was reading GPIO 32 (ADC1 channel 4) for RAW EMG data, so the ADC was floating and the wire was injecting the MyoWare RAW analog signal directly onto the **I2C bus**.
+es?The jumper wire bypassing the broken pogo pin was soldered to the pad labeled **"A4"** on the SparkFun Wireless Shield. Due to Arduino Uno pin-compatibility routing, this pad is connected to **GPIO 21 (ESP32 I2C SDA)**, not to an ADC pin. The firmware was reading GPIO 32 (ADC1 channel 4) for RAW EMG data, so the ADC was floating and the wire was injecting the MyoWare RAW analog signal directly onto the **I2C bus**.
 
 **Why this caused BLE STALLs:**
 The MyoWare RAW output is a low-impedance analog signal that swings between 0V and 3.3V at muscle frequencies (20–500 Hz). I2C SDA is an open-drain bus with a pull-up resistor (~4.7kΩ). When the RAW signal drove SDA **LOW** during a muscle flex, the ESP32 I2C peripheral saw a **stuck-low SDA** — a classic I2C bus lockup. The cascade:

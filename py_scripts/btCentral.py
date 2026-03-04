@@ -260,6 +260,8 @@ class TimeRotatingCsv:
 
         # Use a timestamp with milliseconds to avoid rare collisions where a rotate happens
         # within the same second as the previous open (which could otherwise overwrite files).
+        # FORMAT CONTRACT: open_id = YYYYMMDD_HHMMSS_mmm
+        # capture_loader.py regex must accept this format: (\d{8}_\d{6}(?:_\d{3})?)
         self.open_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int((self.t_open * 1000) % 1000):03d}"
 
         self.fp = open(self._csv_path(), "w", newline="", encoding="utf-8")
@@ -382,7 +384,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ping-sec", type=float, default=5.0)
     ap.add_argument("--stall-warn-ms", type=int, default=2000)
     ap.add_argument("--stall-reconnect-ms", type=int, default=5000)
-    ap.add_argument("--max-backoff-sec", type=float, default=20.0)
+    ap.add_argument("--max-backoff-sec", type=float, default=5.0)
 
     # UDP
     ap.add_argument("--udp-enable", action="store_true")
@@ -963,10 +965,27 @@ async def main() -> None:
 
 
 
-                sleep_s = min(float(args.max_backoff_sec), backoff)
+                # Fast-reconnect for expected transient failures on a nearby wearable:
+                #   stall_*          — watchdog detected silence, device still advertising
+                #   disconnect_event — OS fired disconnect callback, device rebooting/resetting
+                #   TimeoutError     — BLE connect timed out, device likely mid-reboot
+                # For all three: use a short fixed delay and reset backoff.
+                # Only apply exponential backoff for unexpected OS/stack errors where
+                # hammering the adapter would make things worse.
+                reason = st.last_reconnect_reason
+                is_transient = (
+                    reason.startswith("stall_")
+                    or reason == "disconnect_event"
+                    or "TimeoutError" in reason
+                )
+                if is_transient:
+                    sleep_s = 1.0
+                    backoff = 0.5   # reset so next unexpected failure starts from the minimum
+                else:
+                    sleep_s = min(float(args.max_backoff_sec), backoff)
+                    backoff = min(float(args.max_backoff_sec), backoff * 2.0)
                 print(f"[BLE] Reconnecting in {sleep_s:.1f}s (reason={st.last_reconnect_reason})")
                 await asyncio.sleep(sleep_s)
-                backoff = min(float(args.max_backoff_sec), backoff * 2.0)
 
     finally:
         for t in (writer_t, consumer_t, health_t):
