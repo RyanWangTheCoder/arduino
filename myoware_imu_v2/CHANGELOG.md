@@ -1,10 +1,95 @@
-# MyoWare IMU v2 — Changelog
+﻿# MyoWare IMU v2 — Changelog
 
 All notable changes to `myoware_imu_v2.ino` are documented here.
 Format: newest session at the top.
 
 ---
 
+## 2026-03-03 — Session 20: IMU FSR raised — gyro 1000→2000 dps, acc 4→8 g (anti-saturation, balanced)
+
+### Changed (`myoware_imu_v2.ino`)
+```cpp
+// Before:
+static constexpr uint8_t  IMU_ACC_FSR_G    = 4;    // one of {2,4,8,16}  -- was 2 (saturated)
+static constexpr uint16_t IMU_GYRO_FSR_DPS = 1000; // one of {250,500,1000,2000} -- was 250 (saturated)
+
+// After:
+static constexpr uint8_t  IMU_ACC_FSR_G    = 8;    // one of {2,4,8,16}  -- was 4; +-16g rejected (4x resolution loss)
+static constexpr uint16_t IMU_GYRO_FSR_DPS = 2000; // one of {250,500,1000,2000} -- was 1000
+```
+
+### Motivation
+
+**Gyro ±1000 dps → ±2000 dps:**
+Fast sports motions (hard tennis swings, throwing, jumping) can exceed ±1000 dps on peak
+impact. Raising to ±2000 dps eliminates any remaining saturation risk. Resolution drops
+from 32.8 LSB/dps to 16.4 LSB/dps (half). This loss is acceptable because the ICM-20948
+gyro noise floor is ~0.01–0.05 dps — at ±2000 dps, 1 LSB = 0.061 dps, which is right at
+the noise floor. The granularity loss is masked by sensor noise in practice.
+
+**Acc ±4g → ±8g (not ±16g):**
+Tennis/racket impacts typically peak at 4–8g. ±8g covers that range with a safety margin
+and costs only 2× granularity (4096 LSB/g vs 8192 LSB/g). ±16g was considered but
+rejected: it would cost 4× granularity (2048 LSB/g), degrading resolution for subtle
+motion features (fatigue tremor, wrist angle) without meaningful additional headroom.
+
+| Axis | Before | After | Resolution change | Rationale |
+|---|---|---|---|---|
+| Gyro | ±1000 dps / 32.8 LSB/dps | ±2000 dps / 16.4 LSB/dps | ½ | Loss masked by noise floor |
+| Acc  | ±4g / 8192 LSB/g          | ±8g / 4096 LSB/g          | ½ | Best balance: covers 4-8g impacts, only 2x coarser |
+
+### FSR Options Considered for Acc
+
+| FSR | LSB/g | 1 LSB | Saturation | Verdict |
+|---|---|---|---|---|
+| ±4g | 8192 | 0.122 mg | 4g | Saturates on hard impacts |
+| **±8g** ← chosen | **4096** | **0.244 mg** | **8g** | Best balance: covers impacts, only 2x coarser |
+| ±16g | 2048 | 0.488 mg | 16g | Never saturates, but 4x coarser — degrades subtle motion |
+
+### Why There Is No Protocol or Host-Side Impact
+
+The BLE wire format is **completely FSR-agnostic**. The raw `int16` LSB values
+(`ax, ay, az, gx, gy, gz`) are transmitted unchanged regardless of FSR setting —
+the FSR only changes how the sensor hardware maps physical motion to those LSB values.
+
+Every IMU frame already carries the FSR codes in bytes 12–13 of the IMU meta
+(`FLAG_IMU_META_V2`), transmitted since Session 16:
+```cpp
+*p++ = accFsrToCode(IMU_ACC_FSR_G);      // 2 = 8g
+*p++ = gyroFsrToCode(IMU_GYRO_FSR_DPS); // 3 = 2000 dps
+```
+`btCentral.py` reads these codes from each frame and applies the correct scale factor
+automatically — no host-side changes needed:
+```python
+ACC_FSR_CODE_TO_G    = {0: 2, 1: 4, 2: 8, 3: 16}          # code 2 → 8g   ✓
+GYRO_FSR_CODE_TO_DPS = {0: 250, 1: 500, 2: 1000, 3: 2000} # code 3 → 2000 dps ✓
+acc_map = {2: 16384.0, 4: 8192.0, 8: 4096.0, 16: 2048.0}  # already present
+gyr_map = {250: 131.0, 500: 65.5, 1000: 32.8, 2000: 16.4}  # already present
+```
+
+| Layer | Impact |
+|---|---|
+| BLE wire format | ✅ None — same packet structure, same byte count |
+| `PROTO_VER` | ✅ No bump — FSR is a runtime config value, not a structural format change |
+| `PROTOCOL.md` | ✅ None — FSR codes 0–3 already documented for all valid values |
+| `btCentral.py` | ✅ None — codes 2 and 3 already in both lookup tables |
+| CSV output | ✅ None — `acc_fsr_g` and `gyro_fsr_dps` columns show `8` and `2000` |
+| Windows / Android | ✅ None — same BLE notifications, same parsing logic |
+
+The `btCentral.py` fallback defaults (`cur_acc_fsr_g = 4`, `cur_gyro_fsr_dps = 1000`)
+are only used for old captures without `FLAG_IMU_META_V2`. New captures always override
+them from the frame — no fallback update needed.
+
+### FSR Lookup Table (Reference)
+
+| Code | Acc FSR | LSB/g | Gyro FSR | LSB/dps |
+|------|---------|-------|----------|---------|
+| 0 | 2g | 16384 | 250 dps | 131.0 |
+| 1 | 4g | 8192 | 500 dps | 65.5 |
+| 2 | **8g** ← new | **4096** | 1000 dps | 32.8 |
+| 3 | 16g | 2048 | **2000 dps** ← new | **16.4** |
+
+---
 ## 2026-03-02 — Revert Massive Watchdog Timeouts (Brown-out Discovery)
 
 ### Changed

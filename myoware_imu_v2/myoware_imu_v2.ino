@@ -104,8 +104,8 @@ static constexpr uint8_t TLV_VITALS    = 0x03;
 // The FSR codes are transmitted in every IMU meta frame (FLAG_IMU_META_V2),
 // so the Python decoder (capture_loader.py) applies the correct scaling
 // automatically -- no decoder changes needed when changing these values.
-static constexpr uint8_t  IMU_ACC_FSR_G     = 4;    // one of {2,4,8,16}  -- was 2 (saturated)
-static constexpr uint16_t IMU_GYRO_FSR_DPS  = 1000; // one of {250,500,1000,2000} -- was 250 (saturated)
+static constexpr uint8_t  IMU_ACC_FSR_G     = 8;    // one of {2,4,8,16}  -- was 4; +-16g was too coarse (4x resolution loss)
+static constexpr uint16_t IMU_GYRO_FSR_DPS  = 2000; // one of {250,500,1000,2000} -- was 1000
 
 struct EmgSample { uint16_t env, raw; uint32_t t_us, seq; };
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; uint32_t t_us, seq; };
