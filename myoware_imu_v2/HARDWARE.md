@@ -11,7 +11,7 @@ Both sensors output a **bandpass-filtered, amplified EMG signal** centered aroun
 | Feature | MyoWare 2.0 | SEED/Grove EMG |
 |---|---|---|
 | Instrumentation amplifier | ✅ Medical-grade INA | ✅ Consumer-grade |
-| Hardware bandpass | **50–500 Hz** | ~20–500 Hz |
+| Hardware bandpass | **20–500 Hz** | ~20–500 Hz |
 | Hardware envelope output | ✅ **ENV pin** (rectified + smoothed) | ❌ None |
 | DC bias | ~1843 counts (stable) | Less stable |
 | Electrode connectors | Snap (standard Ag/AgCl) | Integrated, less flexible |
@@ -25,15 +25,19 @@ Both sensors output a **bandpass-filtered, amplified EMG signal** centered aroun
 
 **MyoWare 2.0 is the better choice.** Reasons:
 
-1. **50 Hz low cutoff** eliminates motion artifact (5–20 Hz) that corrupts MDF estimates.
-   SEED's ~20 Hz cutoff passes motion artifact into the signal.
+1. **Hardware ENV pin** is unique to MyoWare 2.0 — SEED has no hardware envelope output.
+   Both sensors share a similar ~20 Hz hardware low cutoff, but MyoWare's ENV pin provides
+   a free signal quality / validity indicator that SEED cannot match.
 
-2. **Hardware ENV pin** provides a free signal quality / validity indicator.
-   The `sensordata_plotter.py` ENV comparison subplot uses it to detect saturation and
-   electrode contact loss in real time. SEED requires software-only envelope.
-
-3. **Higher SNR** from the medical-grade instrumentation amplifier gives cleaner FFT
+2. **Higher SNR** from the medical-grade instrumentation amplifier gives cleaner FFT
    spectra, which is critical for reliable MDF shift detection across a tennis session.
+   The `sensordata_plotter.py` ENV comparison subplot uses the ENV pin to detect saturation
+   and electrode contact loss in real time. SEED requires software-only envelope.
+
+3. **Software 50 Hz high-pass** in `preprocess_emg()` further rejects the 20–50 Hz band
+   (residual motion artifact + low-frequency EMG components less useful for MDF analysis).
+   This is a software choice, not a hardware difference — both sensors have a ~20 Hz
+   hardware low cutoff.
 
 4. **Existing codebase is built around MyoWare** — `btCentral.py`, `FatigueMonitor`,
    the Android app all assume dual-output (RAW + ENV). Switching to SEED would require
