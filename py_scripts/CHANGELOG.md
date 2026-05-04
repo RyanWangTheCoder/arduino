@@ -2,6 +2,27 @@
 
 ---
 
+## [2026-05-03] — Fix: EMG ENV saturation counter + stale FSR defaults (`btCentral.py`)
+
+### Added
+- `Stats.emg_env_sat` counter: increments whenever a raw ENV ADC sample ≥ 4090
+  (near the 12-bit ADC ceiling of 4095). Displayed in `[Health]` line as
+  `emg_env_sat=N` alongside the existing `imu_sat=N`.
+  **Motivation:** Experiment 14 (RAW/ENV consistency diagnostic) found 14.2% ENV
+  saturation in log0303 that was only discovered post-hoc. Adding this counter
+  provides real-time capture-side warning: if `emg_env_sat` grows rapidly during a
+  session, reduce the MyoWare gain potentiometer before continuing.
+
+### Fixed
+- Stale IMU FSR defaults in `consumer_task`:
+  - `cur_acc_fsr_g`: 4 → **8** (firmware updated 2026-03-04 Session 20)
+  - `cur_gyro_fsr_dps`: 1000 → **2000** (firmware updated 2026-03-04 Session 20)
+  These defaults only apply to frames without `FLAG_IMU_META_V2` (old firmware).
+  Current firmware always sends FSR codes in every frame, so this is a cosmetic fix,
+  but prevents confusion if old firmware is ever used again.
+
+---
+
 ## [2026-03-03] — Fix: fast reconnect for stall/disconnect (`btCentral.py`)
 
 ### Problem

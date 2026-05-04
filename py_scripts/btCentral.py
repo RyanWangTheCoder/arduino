@@ -311,6 +311,7 @@ class Stats:
     crc_errors: int = 0
     queue_drops: int = 0
     imu_sat: int = 0
+    emg_env_sat: int = 0   # ENV ADC value >= 4090 (near 12-bit ceiling of 4095)
 
 
 def is_imu_saturated(sample6: np.ndarray) -> bool:
@@ -477,7 +478,8 @@ async def health_task(st: RecorderState, args: argparse.Namespace) -> None:
         print(
             f"[Health] seg={seg_idx} off={seg_off} state={state} conn_sub={int(st.subscribed)} "
             f"fps={fps} notify/s={nps} rx_kB/s={bps/1024.0:.1f} q={st.q.qsize()} "
-            f"crc={st.stats.crc_errors} q_drop={st.stats.queue_drops} imu_sat={st.stats.imu_sat} "
+            f"crc={st.stats.crc_errors} q_drop={st.stats.queue_drops} "
+            f"imu_sat={st.stats.imu_sat} emg_env_sat={st.stats.emg_env_sat} "
             f"{batt_str}  "
             f"last_notify={age_notify}ms last_good={age_good}ms ping_age={age_pingok}ms ping_fail={st.ping_fail} "
             f"gaps/s={gaps_s} recon={st.reconnects} reason={st.last_reconnect_reason}"
@@ -492,8 +494,8 @@ async def health_task(st: RecorderState, args: argparse.Namespace) -> None:
 
 
 async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
-    cur_acc_fsr_g = 4     # matches firmware IMU_ACC_FSR_G=4 (was 2, saturated)
-    cur_gyro_fsr_dps = 1000  # matches firmware IMU_GYRO_FSR_DPS=1000 (was 250, saturated)
+    cur_acc_fsr_g = 8     # current firmware default: IMU_ACC_FSR_G=8 (updated 2026-03-04 Session 20)
+    cur_gyro_fsr_dps = 2000  # current firmware default: IMU_GYRO_FSR_DPS=2000 (updated 2026-03-04 Session 20)
 
     # Cooperative scheduling: periodically yield to the event loop so writer_task/health_task
     # can run even when we are processing large EMG/IMU batches.
@@ -568,6 +570,10 @@ async def consumer_task(st: RecorderState, args: argparse.Namespace) -> None:
                             raw = int(samples[i, 1])
                             ref = int(samples[i, 2]) if ch > 2 else 0
                             st.emg_rows.append([dev_us, seq0 + i, env, raw, ref, int(frame_seq), host_rx])
+
+                            # ENV saturation detection (12-bit ADC ceiling = 4095)
+                            if env >= 4090:
+                                st.stats.emg_env_sat += 1
 
                             # UDP plot telemetry (decimated)
                             if st.udp_sock is not None:

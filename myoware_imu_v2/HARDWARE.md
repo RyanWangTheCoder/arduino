@@ -2,7 +2,98 @@
 
 ---
 
-## 0. EMG Sensor Comparison: MyoWare 2.0 vs SEED/Grove EMG
+## 0. REF Electrode Placement (Vendor Guidance + Actual Practice)
+
+### Official Recommendation
+
+From the **SparkFun MyoWare 2.0 Advanced Guide**
+(https://cdn.sparkfun.com/assets/learn_tutorials/1/9/5/6/MyoWare_v2_AdvancedGuide-Updated.pdf):
+
+> *"The reference electrode should be placed on a separate section of the body,
+> such as the **bony portion of the elbow** or a **nonadjacent muscle**."*
+
+### Vendor-Listed REF Sites for Forearm/Wrist Region
+
+The Advanced Guide body diagram lists these electrically neutral reference
+positions relevant to forearm recordings:
+
+| Landmark | Location | Suitability |
+|---|---|---|
+| Epicondylus lateralis/medialis | Lateral/medial epicondyle at elbow | ✅ Bony, away from flexors |
+| Olecranon | Bony point of elbow | ✅ Bony, electrically neutral |
+| Processus styloideus ulnae | Ulnar styloid — wrist, pinky side | ✅ Bony, but far from sensor |
+| Processus styloideus radii | Radial styloid — wrist, thumb side | ✅ Bony, but far from sensor |
+
+### Actual Placement Used in This Study
+
+**REF electrode: lateral epicondyle region, proximal end of the extensor
+muscle group, closer to the elbow — on the opposite side of the forearm
+from the flexor electrodes (MID and END).**
+
+```
+  Elbow end
+  ─────────────────────────────────────────────
+  [posterior/lateral forearm — extensor side]
+       ●  REF  ← placed here, near epicondyle
+  ─────────────────────────────────────────────
+        forearm cross-section
+  ─────────────────────────────────────────────
+  [anterior/medial forearm — flexor side]
+       ●  MID  ← over flexor muscle belly
+       ●  END  ← 1-3 cm distal toward wrist
+  ─────────────────────────────────────────────
+  Wrist end
+```
+
+**Rationale:**
+- Lateral epicondyle is a bony prominence with minimal EMG signal from
+  the forearm flexors — consistent with vendor guidance
+- Placing REF on the extensor side keeps it away from the target flexor
+  muscle signal, maximising the differential signal quality
+- Near the elbow minimises the sensor board cable length needed to reach
+  the REF snap socket — practical for a board-mounted sensor
+
+**Potential crosstalk caveat:**
+The lateral epicondyle region has extensor muscle nearby. If the REF snap
+lands on extensor muscle belly (not the bony epicondyle itself), a small
+amount of extensor EMG may enter the REF signal, slightly degrading the
+common-mode rejection ratio (CMRR) of the differential amplifier. To
+minimise this, place REF on the palpable bony prominence (the epicondyle
+itself), not on the soft tissue adjacent to it.
+
+**For the paper:** cite as *"REF electrode placed over the lateral
+epicondyle region, proximal to the extensor muscle group, consistent with
+vendor-recommended electrically neutral bony prominence placement
+[SparkFun MyoWare 2.0 Advanced Guide, 2023]."*
+
+### Why NOT Ulnar Styloid (Wrist) for This Setup
+
+The ulnar styloid is a valid REF site (listed in vendor guide) but is
+less practical here because:
+- It is at the far end of the forearm from the sensor board
+- Requires a longer external reference cable (adds noise risk)
+- The on-board REF snap socket is at the elbow-side of the board
+  when the sensor is mounted over the forearm flexor belly
+
+### SENIAM Note
+
+SENIAM guidelines (Hermens et al. 2000) — the academic standard — **explicitly
+exclude forearm muscles for wrist movements**. The MyoWare vendor guide directly
+fills this gap with specific anatomical landmarks. Our placement follows vendor
+guidance and is consistent with the general SENIAM principle of placing REF on
+electrically neutral tissue.
+
+### Cable and Noise Implications
+
+The Advanced Guide states: *"MyoWare 2.0 Cable Shield is recommended"*
+when using the optional external reference cable. This confirms unshielded
+longer cables pick up EM interference. Our setup uses the on-board REF snap
+socket — rigid metal snap, ~3 cm unamplified path, no cable sway or
+triboelectric noise.
+
+---
+
+## 0b. EMG Sensor Comparison: MyoWare 2.0 vs SEED/Grove EMG
 
 ### Why RAW signals from both sensors look similar
 
