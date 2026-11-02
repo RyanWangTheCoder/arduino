@@ -172,7 +172,7 @@ The SparkFun MyoWare 2.0 ecosystem uses snap connectors to stack boards. However
 
 To pass the `RAW` and `REF` signals to the Wireless Shield, SparkFun designed the shield with two tiny, spring-loaded **pogo pins** on its underside. These pogo pins are meant to physically press against the `RAW` and `REF` plated through-hole (PTH) pads on the Muscle Sensor board below it.
 
-If your CSV data shows a floating `RAW` pin (as seen in the logs above), it means **the pogo pin connection has failed**. Common reasons for this include:
+If your CSV data shows a floating `RAW` input (as seen in the logs above), it means **the RAW signal path has failed**. A pogo pin, the RAW/A4 solder jumper, a board trace, or a mechanical alignment problem can cause this. Common reasons include:
 1. **Misalignment:** The boards are not snapped together perfectly flat, preventing the pogo pin from touching the pad.
 2. **Damaged Pin:** A pogo pin is stuck in the compressed position, bent, or missing.
 3. **Dirty Contact:** Flux residue, oxidation, or skin oils on the Muscle Sensor's `RAW` PTH pad are preventing electrical conductivity.
@@ -194,34 +194,80 @@ If the pogo pins are damaged or unreliable during active sports/movement, you mu
 2. Locate the pad labeled **`32`** on the underside of the Wireless Shield.
 3. **Solder a flexible jumper wire** directly between these two pads.
 
-### The "A4" Naming Trap
-The original firmware code comments incorrectly assumed that the pad labeled "A4" on the shield routed to ESP32 GPIO 32:
-```cpp
-// ==================== EMG Pins ====================
-static constexpr int PIN_ENV = 39; // A3 (ADC1)
-static constexpr int PIN_RAW = 32; // A4 (ADC1) - THIS COMMENT WAS WRONG!
-```
-On original Arduino Uno boards, A4 is the I2C SDA pin. To maintain compatibility with Uno shields, SparkFun routed the ESP32's actual I2C SDA pin (**GPIO 21**) to the hole labeled "A4". GPIO 21 is strictly a digital pin and has no ADC capabilities.
+### The `RAW`, `A4`, and `32` labels are different things
+The board uses several labels for different parts of the signal path:
 
-Because the code was listening to GPIO 32, but the physical wire was soldered to the digital I2C bus (A4), the ESP32 ADC was reading a floating pin.
+| Label or part | Meaning |
+|---|---|
+| `RAW` on the MyoWare sensor | High-frequency, midpoint-biased EMG output needed for spectral analysis |
+| RAW pogo pin | Spring-loaded contact from the Wireless Shield to the sensor's RAW plated-through hole |
+| `RAW/A4` area on the Wireless Shield | A solder jumper: the sensor-side RAW net and the adjacent A4-side board connection |
+| `A4` hole | A physical board/header location labeled with the Arduino-style analog name |
+| `32` hole/pad | Physical ESP32 GPIO32 breakout used by this firmware |
+| `ADC_CHANNEL_4` | ESP32 ADC peripheral channel identifier; on the ESP32-WROOM-32E, ADC1 channel 4 is GPIO32 |
 
-### How We Debugged It (The "Finger Touch" Test)
-To prove the physical disconnect, a tiny diagnostic Arduino sketch was flashed to the ESP32 to print the values of all ADC1 channels to the Serial Monitor:
-```cpp
-void setup() { Serial.begin(115200); }
-void loop() {
-  Serial.print("Pin36:"); Serial.print(analogRead(36)); Serial.print("\t");
-  Serial.print("Pin37:"); Serial.print(analogRead(37)); Serial.print("\t");
-  Serial.print("Pin39(ENV):"); Serial.print(analogRead(39)); Serial.print("\t");
-  Serial.print("Pin32:"); Serial.print(analogRead(32)); Serial.print("\t");
-  Serial.print("Pin33:"); Serial.print(analogRead(33)); Serial.println();
-  delay(100);
-}
+The intended signal path is therefore:
+
+```text
+MyoWare RAW pad
+  -> RAW pogo pin
+  -> Wireless Shield RAW side of the solder jumper
+  -> A4-side PCB route
+  -> ESP32 GPIO32 / ADC1 channel 4
 ```
-While running this script, the user physically touched the "A4" pad with their bare finger. Because the human body acts as an antenna for 60Hz mains noise, touching an active ADC pin causes the readings to swing wildly (0 to 4095). **Touching A4 produced no change**, proving it was not connected to any of the ADC pins being scanned. Touching the pad explicitly labeled `32` on the back of the shield caused massive fluctuations, confirming the correct routing.
+
+The SparkFun [MyoWare 2.0 Wireless Shield product page](https://www.sparkfun.com/myoware-2-0-wireless-shield.html) confirms that the shield has low-profile pogo pins and RAW/REF/ENV solder jumpers. The product photo shows `RAW` next to `A4`, while the GPIO `32` breakout is a separate physical location. Different physical locations can still be the same electrical net, but that must be confirmed with a continuity measurement; the labels alone do not prove it.
+
+The firmware does not read a symbol named `A4`. It configures ADC1 channel 4 and then classifies channel-4 DMA records as RAW:
+
+```cpp
+static constexpr adc_channel_t ADC_CH_RAW = ADC_CHANNEL_4;
+patterns[1].channel = ADC_CH_RAW;
+patterns[1].unit = ADC_UNIT_1;
+```
+
+Thus, soldering directly from the sensor's RAW pad to the physical shield pad `32` is a valid bypass: it skips the pogo contact, the RAW/A4 solder jumper, and any uncertain intermediate PCB route.
+
+### End-to-end connection map
+The labels describe different layers of the same signal path:
+
+```text
+MyoWare electrodes
+  -> MyoWare amplifier
+  -> EMG-board RAW plated-through hole
+  -> RAW pogo contact on the Wireless Shield
+  -> RAW-side solder jumper
+  -> A4-side PCB route
+  -> ESP32 GPIO32
+  -> ADC1 channel 4
+  -> emgDrainTask s.raw
+  -> BLE frame and host CSV raw column
+```
+
+The other outputs follow parallel paths. The EMG board's `RECT` output is the shield's envelope/`ENV` path and normally travels through the stacked-board connection to GPIO39 / ADC1 channel 3. The `REF` output uses the second pogo contact and the `REF/A5` jumper, but this firmware sets `REF_CONNECTED = false` and does not include REF in the two-channel ADC DMA pattern.
+
+The large snap connections provide the ordinary stacked-board power, ground, and envelope connections. The two small pogo pins provide the extra RAW and REF connections. This is why a RAW pogo failure can leave ENV working: the two signals use different physical routes.
+
+The repair wire creates this shorter route:
+
+```text
+EMG-board RAW pad -- flexible solder wire --> Wireless Shield pad 32 / GPIO32
+```
+
+It bypasses the spring contact and the intermediate solder-jumper route. The 2026-10-25 capture confirms that this direct route reached the firmware's GPIO32 ADC input. It does not prove that the original pogo contact or the complete RAW-to-A4-to-32 route will remain reliable during movement. Use strain relief on the repair wire and keep it away from neighboring power, ground, A3, A4, and A5 pads.
+
+### How to confirm the physical path
+Perform these tests with USB and battery power disconnected and the boards separated:
+
+1. Measure each shield pogo pin to the shield's RAW and REF jumper sides. The RAW pogo pin should have near-zero resistance to the RAW side.
+2. Measure across the RAW-to-A4 solder jumper. An open or cracked jumper breaks the path even if the pogo pin touches the sensor.
+3. Measure the A4-side connection to the physical pad `32`. Near-zero resistance confirms the board route; an open reading means the two physical points are not connected on that board or the probe points are misidentified.
+4. With the boards stacked, measure from the MyoWare RAW plated-through hole to physical pad `32` while gently pressing and moving the shield. Intermittent continuity indicates a pogo or mechanical-contact problem.
+
+Do not use the old Uno convention that `A4` must mean I2C SDA/GPIO21 as evidence about this board. The current evidence establishes that the firmware reads GPIO32 and that the pad-32 bypass worked; it does not establish RAW/A4-to-32 continuity without the continuity test above.
 
 ### The "Ghost" Signal & ADC Crosstalk
-During the period where the RAW pin was floating, the CSV logs showed the `raw` column maintaining a constant ~37% to ~44% ratio relative to the `env` column, with a correlation of 0.998. 
+During the period where the RAW input was floating, the CSV logs showed the `raw` column maintaining a constant ~37% to ~44% ratio relative to the `env` column, with a correlation of 0.998.
 
 **Why does RAW mirror ENV if it is disconnected?**
 This is caused by **ADC Multiplexer Charge Sharing (Crosstalk)**. The ESP32 ADC Continuous (DMA) mode switches channels at 40 kHz. The internal Sample-and-Hold (S/H) capacitor charges to the actively driven `ENV` voltage (GPIO 39). When the multiplexer switches to the floating `RAW` pin (GPIO 32), the pin has no driving source. The charge is distributed between the S/H capacitor and the parasitic capacitance of the floating pin/trace, resulting in a predictable fractional voltage drop (the ~40% ghost signal). 
@@ -239,7 +285,7 @@ Further down, the firmware configures the hardware Direct Memory Access (DMA) to
 static constexpr adc_channel_t ADC_CH_ENV  = ADC_CHANNEL_3;
 static constexpr adc_channel_t ADC_CH_RAW  = ADC_CHANNEL_4;
 ```
-Finally, inside the `emgDrainTask`, the data from channel 4 is saved into the `s.raw` variable and transmitted via BLE. Because the ESP32 is exclusively listening to `A4` for the raw signal, the jumper wire *must* go to this exact pad.
+Finally, inside the `emgDrainTask`, the data from channel 4 is saved into the `s.raw` variable and transmitted via BLE. Because the ESP32 is listening to **GPIO32** for the RAW signal, the repair wire was placed on the shield pad labeled `32`. The nearby `A4` location is part of the board's RAW jumper labeling; it should not be treated as interchangeable with `32` unless continuity is confirmed.
 
 ### What about the REF pogo pin?
 While the MyoWare Advanced Guide notes that monitoring the Reference (`REF`) electrode signal can be useful for advanced diagnostics (such as measuring common-mode noise on the user's skin), **you do not need to solder a bypass wire for the REF pin** with your current setup.
@@ -264,7 +310,7 @@ You will observe:
 3. **The Ghost RAW Trace:** The `Raw EMG` trace (black) shows very tiny, smoothed-out bumps that perfectly mimic the shape of the orange ENV line below it.
 
 **Why does RAW mirror ENV if it is disconnected?**
-This is caused by **capacitive coupling**. A floating pin on a compact PCB acts like a tiny antenna. The copper trace for the `ENV` signal runs physically parallel to the floating `RAW` (A4) pin. When the muscle flexes, the strong, slow-moving DC voltage of the `ENV` signal induces a small, faint "ghost" voltage onto the nearby `RAW` trace.
+This is caused by **capacitive coupling**. A floating pin on a compact PCB acts like a tiny antenna. The copper trace for the `ENV` signal can run physically near the floating `RAW` net. When the muscle flexes, the strong, slow-moving DC voltage of the `ENV` signal induces a small, faint "ghost" voltage onto the nearby floating RAW trace.
 
 Because this ghost signal is just a slow DC-like trace, when the Python script passes it through `preprocess_emg` (which applies a high-pass filter to block DC noise and keep only AC muscle frequencies), the ghost signal gets completely wiped out, resulting in the flatline seen in the preprocessed plot. Because the preprocessed signal is dead, all subsequent calculations (RMS, MDF, MNF) fail.
 
@@ -272,3 +318,36 @@ Because this ghost signal is just a slow DC-like trace, when the Python script p
 After applying the jumper wire, capture a new log. You should observe the following:
 * **In the CSV:** At rest, the `raw` column should hover around `2048`. During a muscle flex, the `raw` column should oscillate rapidly and wildly up and down (e.g., swinging quickly between `500` and `3500`).
 * **In the Plotter:** The `Raw EMG` and `Preprocessed EMG` traces will show dense, high-frequency "fuzz" (AC waveform) during flexes, and the `EMG RMS` line will spike up in perfect sync with the `ENV` line.
+
+### 5.1 Measured confirmation after the pad-32 solder repair
+
+A new recording was captured on 2026-10-25 after soldering the MyoWare `RAW` pad to Wireless Shield pad `32`. The detailed report is [log_10252026.md](../py_scripts/log_10252026.md).
+
+This recording confirms that the soldered path is electrically carrying a usable RAW signal:
+
+- The firmware was listening to `ADC1 channel 4`, which is the ESP32-WROOM-32E's GPIO32 input. The repair used the physical shield pad labeled `32`; the separate `RAW/A4` jumper route was not assumed to be continuous without measurement.
+- The EMG log contained 314,156 samples at the configured 2,000 Hz rate over approximately 157.5 seconds.
+- RAW values ranged from 1,622 to 2,076 counts, with a median of 1,859. The signal was near the MyoWare ADC midpoint rather than stuck near zero or a rail.
+- RAW was not flat: 81.6% of adjacent samples changed, and the longest exact constant run was only 12 samples.
+- During a low-activity interval, high-pass RAW RMS was approximately 3.35 counts. During an active interval it rose to approximately 31.6 counts, with a RAW range of approximately 454 counts.
+- The correct amplitude comparison is not signed RAW versus ENV sample correlation, because RAW oscillates around its DC midpoint while ENV is rectified and smoothed. One-second high-pass RAW RMS versus hardware ENV mean had Pearson `r = 0.988` and Spearman `rho = 0.991`.
+- Active RAW energy in the practical 20–500 Hz EMG band was approximately 10.4 times the 0–20 Hz energy, compared with 4.3 times during a low-activity interval.
+
+An independent IMU cross-check also supported the result. The canonical `emg_util` analysis found a positive EMG-versus-gyro relationship (`r = 0.377` at zero lag; approximately `r = 0.434` with the IMU about 0.5 seconds later). This is supporting evidence that the RAW bursts are related to real movement, not proof by itself: isometric muscle activation can occur without much motion, and motion can occur without EMG activation.
+
+There were 928 missing EMG samples out of 315,084 expected samples, approximately 0.3%, across four BLE transport gaps. That is a capture-continuity issue, not evidence that the GPIO32 solder connection failed.
+
+**Conclusion:** the pad-32 solder repair is confirmed electrically for this recording. It does not yet prove that the jumper will remain mechanically reliable during every sports movement; a controlled contraction and movement test is still recommended.
+
+### 5.2 Narrowband lines in RAW from on-board I2C activity (2026-11-01)
+
+A good RAW connection is not enough on its own for clean spectra. In `log0305` the RAW channel carries narrowband lines,
+and their strength tracks the firmware's IMU I2C polling:
+- **200 and 400 Hz** are about 10 dB stronger while the IMU is polled every 5 ms than during IMU outages.
+- **333 Hz** appears only while the IMU is polled about every 3 ms.
+
+60 Hz mains has no 200 Hz harmonic. The coupling path from the I2C bus into the ADC inputs is a hypothesis; a bench
+test is still pending.
+
+For the evidence table, the firmware mechanism and the planned test, see `HLD_FW.md` →
+*As-Built Review* → *KI-2* and *Pending next steps* item 3. Treat these line bins as interference in any MDF analysis.
